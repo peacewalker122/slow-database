@@ -1,0 +1,89 @@
+use std::{
+    fs::OpenOptions,
+    io::{Read, Write},
+};
+
+pub fn store_log(filename: &str, key: &[u8], value: &[u8]) -> Result<(), std::io::Error> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(filename)?;
+
+    let record = encode_record(key, value);
+    file.write_all(&record)?;
+
+    Ok(())
+}
+
+fn encode_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + 4 + key.len() + value.len() + 4);
+
+    let checksum = crc32fast::hash(value);
+
+    buf.extend_from_slice(&(key.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&(value.len() as u32).to_be_bytes());
+
+    buf.extend_from_slice(key);
+    buf.extend_from_slice(value);
+
+    buf.extend_from_slice(&checksum.to_be_bytes());
+
+    buf
+}
+
+pub fn decode_record(record: impl Read) -> Result<(Vec<u8>, Vec<u8>), std::io::Error> {
+    let mut reader = record;
+
+    let mut len_buf = [0u8; 4];
+
+    reader.read_exact(&mut len_buf)?;
+    let key_len = u32::from_be_bytes(len_buf) as usize;
+
+    reader.read_exact(&mut len_buf)?;
+    let value_len = u32::from_be_bytes(len_buf) as usize;
+
+    let mut key = vec![0u8; key_len];
+    reader.read_exact(&mut key)?;
+
+    let mut value = vec![0u8; value_len];
+    reader.read_exact(&mut value)?;
+
+    reader.read_exact(&mut len_buf)?;
+    let checksum = u32::from_be_bytes(len_buf);
+
+    if crc32fast::hash(&value) != checksum {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Checksum mismatch",
+        ));
+    }
+
+    Ok((key, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+
+    use super::*;
+
+    #[test]
+    fn test_decode_log() {
+        let data: &[u8] = &encode_record(b"key0", b"value0");
+
+        let result = decode_record(data).unwrap();
+
+        assert_eq!(result.0, b"key0");
+        assert_eq!(result.1, b"value0");
+    }
+
+    #[test]
+    fn test_integration_decode_log() {
+        let file = File::open("app.log").unwrap();
+
+        let result = decode_record(file).unwrap();
+
+        assert_eq!(result.0, b"key0");
+        assert_eq!(result.1, b"value1");
+    }
+}

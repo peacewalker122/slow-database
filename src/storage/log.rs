@@ -3,6 +3,13 @@ use std::{
     io::{Read, Write},
 };
 
+#[derive(Debug)]
+struct DecodeRecordResult {
+    key: Vec<u8>,
+    val: Vec<u8>,
+    offset: u64,
+}
+
 pub fn store_log(filename: &str, key: &[u8], value: &[u8]) -> Result<(), std::io::Error> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -20,8 +27,8 @@ fn encode_record(key: &[u8], value: &[u8]) -> Vec<u8> {
 
     let checksum = crc32fast::hash(value);
 
-    buf.extend_from_slice(&(key.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&(key.len() as u64).to_be_bytes());
+    buf.extend_from_slice(&(value.len() as u64).to_be_bytes());
 
     buf.extend_from_slice(key);
     buf.extend_from_slice(value);
@@ -31,16 +38,16 @@ fn encode_record(key: &[u8], value: &[u8]) -> Vec<u8> {
     buf
 }
 
-pub fn decode_record(record: impl Read) -> Result<(Vec<u8>, Vec<u8>), std::io::Error> {
+pub fn decode_record(record: impl Read) -> Result<Box<DecodeRecordResult>, std::io::Error> {
     let mut reader = record;
 
-    let mut len_buf = [0u8; 4];
+    let mut len_buf = [0u8; 8];
 
     reader.read_exact(&mut len_buf)?;
-    let key_len = u32::from_be_bytes(len_buf) as usize;
+    let key_len = u64::from_be_bytes(len_buf) as usize;
 
     reader.read_exact(&mut len_buf)?;
-    let value_len = u32::from_be_bytes(len_buf) as usize;
+    let value_len = u64::from_be_bytes(len_buf) as usize;
 
     let mut key = vec![0u8; key_len];
     reader.read_exact(&mut key)?;
@@ -48,8 +55,9 @@ pub fn decode_record(record: impl Read) -> Result<(Vec<u8>, Vec<u8>), std::io::E
     let mut value = vec![0u8; value_len];
     reader.read_exact(&mut value)?;
 
-    reader.read_exact(&mut len_buf)?;
-    let checksum = u32::from_be_bytes(len_buf);
+    let mut crc_buf = [0u8; 4];
+    reader.read_exact(&mut crc_buf)?;
+    let checksum = u32::from_be_bytes(crc_buf);
 
     if crc32fast::hash(&value) != checksum {
         return Err(std::io::Error::new(
@@ -58,7 +66,13 @@ pub fn decode_record(record: impl Read) -> Result<(Vec<u8>, Vec<u8>), std::io::E
         ));
     }
 
-    Ok((key, value))
+    let result = Box::new(DecodeRecordResult {
+        key,
+        val: value,
+        offset: (16 + key_len + value_len + 4) as u64,
+    });
+
+    return Ok(result);
 }
 
 #[cfg(test)]
@@ -73,8 +87,9 @@ mod tests {
 
         let result = decode_record(data).unwrap();
 
-        assert_eq!(result.0, b"key0");
-        assert_eq!(result.1, b"value0");
+        assert_eq!(result.key, b"key0");
+        assert_eq!(result.val, b"value0");
+        assert_eq!(result.offset, 30);
     }
 
     #[test]
@@ -83,7 +98,8 @@ mod tests {
 
         let result = decode_record(file).unwrap();
 
-        assert_eq!(result.0, b"key0");
-        assert_eq!(result.1, b"value1");
+        assert_eq!(result.key, b"key1");
+        assert_eq!(result.val, b"value1");
+        assert_eq!(result.offset, 30);
     }
 }

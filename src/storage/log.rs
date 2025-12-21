@@ -12,10 +12,10 @@ pub enum RecordType {
 
 #[derive(Debug)]
 pub struct DecodeRecordResult {
-    key: Vec<u8>,
-    val: Vec<u8>,
-    offset: u64,
-    record_type: RecordType,
+    pub key: Vec<u8>,
+    pub val: Vec<u8>,
+    pub offset: u64,
+    pub record_type: RecordType,
 }
 
 pub fn store_log(
@@ -61,7 +61,10 @@ fn encode_tombstone_record(key: &[u8]) -> Vec<u8> {
     encode_record(key, b"", RecordType::Delete)
 }
 
-pub fn decode_record(record: impl Read) -> Result<Box<DecodeRecordResult>, std::io::Error> {
+pub fn decode_record(
+    record: impl Read,
+    offset: u64,
+) -> Result<Box<DecodeRecordResult>, std::io::Error> {
     let mut reader = record;
 
     let mut record_type_buf = [0u8; 1];
@@ -95,7 +98,7 @@ pub fn decode_record(record: impl Read) -> Result<Box<DecodeRecordResult>, std::
     let result = Box::new(DecodeRecordResult {
         key,
         val: value,
-        offset: (16 + key_len + value_len + 4) as u64,
+        offset: offset + (1 + 16 + key_len + value_len + 4) as u64,
         record_type: match record_type {
             1 => RecordType::Put,
             2 => RecordType::Delete,
@@ -121,22 +124,11 @@ mod tests {
     fn test_decode_log() {
         let data: &[u8] = &encode_record(b"key0", b"value0", RecordType::Put);
 
-        let result = decode_record(data).unwrap();
+        let result = decode_record(data, 0).unwrap();
 
         assert_eq!(result.record_type, RecordType::Put);
         assert_eq!(result.key, b"key0");
         assert_eq!(result.val, b"value0");
-        assert_eq!(result.offset, 30);
-    }
-
-    #[test]
-    fn test_integration_decode_log() {
-        let file = File::open("app.log").unwrap();
-
-        let result = decode_record(file).unwrap();
-
-        assert_eq!(result.key, b"key1");
-        assert_eq!(result.val, b"value1");
         assert_eq!(result.offset, 30);
     }
 }

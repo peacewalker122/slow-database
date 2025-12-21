@@ -54,9 +54,7 @@ This roadmap is language-agnostic but optimized for **Rust-first** with optional
 * Partial writes
 
 ### Deliverable
-* DB survives restart
-    * Need to implement method to re read the given app.log and store it back to the db. Also research about wal checkpoint.
-        - about wal checkpoint, its mean for give the program latest wal checkpoint they need to check first.
+* DB survives restart (It can survives, but need the actual flow to re-read the data back)
 * Correctness > performance
 
 ---
@@ -64,17 +62,14 @@ This roadmap is language-agnostic but optimized for **Rust-first** with optional
 ## Phase 2 — In-Memory Index (Week 2)
 
 ### Concepts
-
 * Indirection
 * Index vs data separation
 
 ### Implementation
-
 * HashMap<Key, FileOffset>
 * Rebuild index on startup
 
 ### Deliverable
-
 * O(1) reads
 * Still append-only writes
 

@@ -1,4 +1,7 @@
-use crate::{api::api::KVEngine, storage};
+use crate::{
+    api::api::KVEngine,
+    storage::{self, log::RecordType},
+};
 
 #[derive(Debug, Default)]
 pub struct InMemoryKV {
@@ -19,7 +22,7 @@ impl KVEngine for InMemoryKV {
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) {
-        storage::log::store_log("app.log", key, value).unwrap();
+        storage::log::store_log("app.log", key, value, RecordType::Put).unwrap();
 
         self.store.insert(key.to_vec(), value.to_vec());
     }

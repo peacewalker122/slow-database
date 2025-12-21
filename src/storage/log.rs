@@ -3,29 +3,48 @@ use std::{
     io::{Read, Write},
 };
 
+#[repr(u8)]
+#[derive(Debug, PartialEq)]
+pub enum RecordType {
+    Put = 1,
+    Delete = 2,
+}
+
 #[derive(Debug)]
-struct DecodeRecordResult {
+pub struct DecodeRecordResult {
     key: Vec<u8>,
     val: Vec<u8>,
     offset: u64,
+    record_type: RecordType,
 }
 
-pub fn store_log(filename: &str, key: &[u8], value: &[u8]) -> Result<(), std::io::Error> {
+pub fn store_log(
+    filename: &str,
+    key: &[u8],
+    value: &[u8],
+    is_tombstone: RecordType,
+) -> Result<(), std::io::Error> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(filename)?;
 
-    let record = encode_record(key, value);
+    let record = match is_tombstone {
+        RecordType::Delete => encode_tombstone_record(key),
+        RecordType::Put => encode_record(key, value, RecordType::Put),
+    };
+
     file.write_all(&record)?;
 
     Ok(())
 }
 
-fn encode_record(key: &[u8], value: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + 4 + key.len() + value.len() + 4);
+fn encode_record(key: &[u8], value: &[u8], record_type: RecordType) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 8 + 8 + key.len() + value.len() + 4);
 
     let checksum = crc32fast::hash(value);
+
+    buf.extend_from_slice(&(record_type as u8).to_be_bytes());
 
     buf.extend_from_slice(&(key.len() as u64).to_be_bytes());
     buf.extend_from_slice(&(value.len() as u64).to_be_bytes());
@@ -38,11 +57,18 @@ fn encode_record(key: &[u8], value: &[u8]) -> Vec<u8> {
     buf
 }
 
+fn encode_tombstone_record(key: &[u8]) -> Vec<u8> {
+    encode_record(key, b"", RecordType::Delete)
+}
+
 pub fn decode_record(record: impl Read) -> Result<Box<DecodeRecordResult>, std::io::Error> {
     let mut reader = record;
 
-    let mut len_buf = [0u8; 8];
+    let mut record_type_buf = [0u8; 1];
+    reader.read_exact(&mut record_type_buf)?;
+    let record_type = record_type_buf[0];
 
+    let mut len_buf = [0u8; 8];
     reader.read_exact(&mut len_buf)?;
     let key_len = u64::from_be_bytes(len_buf) as usize;
 
@@ -70,6 +96,16 @@ pub fn decode_record(record: impl Read) -> Result<Box<DecodeRecordResult>, std::
         key,
         val: value,
         offset: (16 + key_len + value_len + 4) as u64,
+        record_type: match record_type {
+            1 => RecordType::Put,
+            2 => RecordType::Delete,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid record type",
+                ));
+            }
+        },
     });
 
     return Ok(result);
@@ -83,10 +119,11 @@ mod tests {
 
     #[test]
     fn test_decode_log() {
-        let data: &[u8] = &encode_record(b"key0", b"value0");
+        let data: &[u8] = &encode_record(b"key0", b"value0", RecordType::Put);
 
         let result = decode_record(data).unwrap();
 
+        assert_eq!(result.record_type, RecordType::Put);
         assert_eq!(result.key, b"key0");
         assert_eq!(result.val, b"value0");
         assert_eq!(result.offset, 30);

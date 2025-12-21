@@ -1,11 +1,17 @@
+use std::{collections::HashMap, fs::File};
+
 use crate::{
     api::api::KVEngine,
-    storage::{self, log::RecordType},
+    error::DBError,
+    storage::{
+        self,
+        log::{RecordType, decode_record},
+    },
 };
 
 #[derive(Debug, Default)]
 pub struct PersistentKV {
-    store: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    store: std::collections::HashMap<Vec<u8>, u64>,
 }
 
 impl PersistentKV {
@@ -17,14 +23,22 @@ impl PersistentKV {
 }
 
 impl KVEngine for PersistentKV {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.store.get(key).cloned()
+    fn get(&self, key: &[u8]) -> Result<Vec<u8>, DBError> {
+        let offset = self.store.get(key);
+
+        let file = File::open("app.log")?;
+
+        // linearly search the file
+        let result = decode_record(file, *offset.ok_or_else(|| DBError::NotFound)?)?;
+
+        return Ok(result.val);
     }
 
-    fn put(&mut self, key: &[u8], value: &[u8]) {
-        storage::log::store_log("app.log", key, value, RecordType::Put).unwrap();
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), DBError> {
+        let offset = storage::log::store_log("app.log", key, value, RecordType::Put)?;
 
-        self.store.insert(key.to_vec(), value.to_vec());
+        self.store.insert(key.to_vec(), offset);
+        Ok(())
     }
 
     fn delete(&mut self, key: &[u8]) {
@@ -43,10 +57,27 @@ mod tests {
     #[test]
     fn test_in_memory_kv() {
         let mut kv = PersistentKV::new();
-        kv.put(b"key1", "value1".as_bytes());
-        assert_eq!(kv.get(b"key1"), Some(b"value1".to_vec()));
+
+        kv.put(b"key1", b"value1").expect("put failed");
+
+        // --- assert value exists ---
+        let result = kv.get(b"key1");
+        assert_eq!(
+            result.unwrap(),
+            b"value1",
+            "unexpected result from get(key1)"
+        );
+
+        // --- delete ---
         kv.delete(b"key1");
-        assert_eq!(kv.get(b"key1"), None);
+
+        // --- assert not found ---
+        let result = kv.get(b"key1");
+        assert!(
+            matches!(result, Err(DBError::NotFound)),
+            "expected NotFound, got: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -56,25 +87,26 @@ mod tests {
             kv.put(
                 format!("key{i}").as_bytes(),
                 &format!("value{i}").as_bytes(),
-            );
+            )
+            .unwrap();
         }
 
         let file = File::open("app.log").unwrap();
         // from the record we need to find key99
         let mut found = false;
-        let mut offset = 0 as u64;
-        while !found {
-            let result = decode_record(&file, offset).unwrap();
+        let offset = kv
+            .store
+            .get("key44".as_bytes())
+            .expect("harusnya ada sihhh");
 
-            // adjust the offset accordingly
-            offset = result.offset;
+        let result = decode_record(&file, *offset).unwrap();
+        println!("got value: {:?}", result);
 
-            // check the value
-            if result.key == b"key44" {
-                println!("offset were found at: {:?}", result);
-                assert_eq!(result.val, b"value44");
-                found = true;
-            }
+        // check the value
+        if result.key == b"key44" {
+            println!("offset were found at: {:?}", result);
+            assert_eq!(result.val, b"value44");
+            found = true;
         }
 
         assert_eq!(found, true)

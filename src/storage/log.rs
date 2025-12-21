@@ -1,6 +1,6 @@
 use std::{
     fs::OpenOptions,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
 };
 
 #[repr(u8)]
@@ -23,11 +23,14 @@ pub fn store_log(
     key: &[u8],
     value: &[u8],
     is_tombstone: RecordType,
-) -> Result<(), std::io::Error> {
+) -> Result<u64, std::io::Error> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(filename)?;
+
+    let offset = file.metadata()?.len();
+    println!("offset from store_log: {}", offset);
 
     let record = match is_tombstone {
         RecordType::Delete => encode_tombstone_record(key),
@@ -36,7 +39,7 @@ pub fn store_log(
 
     file.write_all(&record)?;
 
-    Ok(())
+    Ok(offset)
 }
 
 fn encode_record(key: &[u8], value: &[u8], record_type: RecordType) -> Vec<u8> {
@@ -61,11 +64,12 @@ fn encode_tombstone_record(key: &[u8]) -> Vec<u8> {
     encode_record(key, b"", RecordType::Delete)
 }
 
-pub fn decode_record(
-    record: impl Read,
-    offset: u64,
-) -> Result<Box<DecodeRecordResult>, std::io::Error> {
+pub fn decode_record<R>(record: R, offset: u64) -> Result<Box<DecodeRecordResult>, std::io::Error>
+where
+    R: Read + Seek,
+{
     let mut reader = record;
+    reader.seek(SeekFrom::Start(offset))?;
 
     let mut record_type_buf = [0u8; 1];
     reader.read_exact(&mut record_type_buf)?;
@@ -116,19 +120,18 @@ pub fn decode_record(
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
+    use std::io::Cursor;
 
     use super::*;
 
     #[test]
     fn test_decode_log() {
         let data: &[u8] = &encode_record(b"key0", b"value0", RecordType::Put);
-
-        let result = decode_record(data, 0).unwrap();
+        let result = decode_record(Cursor::new(data), 0).unwrap();
 
         assert_eq!(result.record_type, RecordType::Put);
         assert_eq!(result.key, b"key0");
         assert_eq!(result.val, b"value0");
-        assert_eq!(result.offset, 30);
+        assert_eq!(result.offset, 31);
     }
 }

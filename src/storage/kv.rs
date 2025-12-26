@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::File};
+use std::fs::File;
 
 use crate::{
     api::api::KVEngine,
@@ -6,18 +6,21 @@ use crate::{
     storage::{
         self,
         log::{RecordType, decode_record},
+        skiplist::SkipList,
     },
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PersistentKV {
     store: std::collections::HashMap<Vec<u8>, u64>,
+    pub memtable: SkipList,
 }
 
 impl PersistentKV {
     pub fn new() -> Self {
         PersistentKV {
             store: std::collections::HashMap::new(),
+            memtable: SkipList::new(),
         }
     }
 }
@@ -38,10 +41,14 @@ impl KVEngine for PersistentKV {
         let offset = storage::log::store_log("app.log", key, value, RecordType::Put)?;
 
         self.store.insert(key.to_vec(), offset);
+        self.memtable.insert(key.to_vec(), (RecordType::Put, value.to_vec()));
+
+        storage::log::flush_memtable(&mut self.memtable)?;
         Ok(())
     }
 
     fn delete(&mut self, key: &[u8]) {
+        // TODO: handle to remove the file into the log.
         self.store.remove(key);
     }
 }
@@ -83,7 +90,7 @@ mod tests {
     #[test]
     fn test_integration_decode_log() {
         let mut kv = PersistentKV::new();
-        for i in 1..100 {
+        for i in 0..100 {
             kv.put(
                 format!("key{i}").as_bytes(),
                 &format!("value{i}").as_bytes(),

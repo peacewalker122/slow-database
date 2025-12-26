@@ -78,19 +78,16 @@ This roadmap is language-agnostic but optimized for **Rust-first** with optional
 ## Phase 3 — Crash Safety & WAL (Week 3)
 
 ### Concepts
-
 * Write-Ahead Logging
 * Durability
 * Recovery
 
 ### Implementation
-
 * `data.log` acts as WAL
 * fsync on write
 * Replay on startup
 
 ### Tests
-
 * Kill process mid-write
 * Restart and validate
 
@@ -105,17 +102,25 @@ This roadmap is language-agnostic but optimized for **Rust-first** with optional
 ### Concepts
 
 * Log-Structured Merge Trees
+    - Memtable -> Flush -> SSTable.
 * Write amplification
 
 ### Implementation
 
-* Memtable (in-memory map)
+* Memtable (in-memory map) 
+    - Use BtreeMap for this.
 * SSTable (sorted immutable file)
+    - When Memtable reach some "threshold" it will be flushed and merged with the SSTable.
 * Binary search reads
+    - Build the file content from the SSTable? to be read in our program.
+* Compaction
 
+### Consideration
+- Skiplist or BTree memtable.
+    - Skiplist guarantee the insertion to be O(log(n)), while BTree give the same O(log(n)) on average. With worst case O(n).
+    - Cache, Skiplist weren't support L1 cache, on the other hand BTree had better cache aligment. Trade off on the read performance.
 ### Deliverable
-
-* No more linear scans
+* No more linear scans, but Log(n) scan...
 
 ---
 

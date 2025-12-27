@@ -5,7 +5,10 @@ use crate::{
     error::DBError,
     storage::{
         self,
-        log::{RecordType, decode_record, read_sstable_footer, read_sstable_index, search_sstable},
+        log::{
+            RecordType, read_sstable_bloom, read_sstable_footer, read_sstable_index,
+            search_sstable_with_bloom,
+        },
         skiplist::SkipList,
     },
 };
@@ -36,8 +39,9 @@ impl KVEngine for PersistentKV {
         }
         let file = File::open("app.db")?;
         let footer = read_sstable_footer(&file)?;
+        let bloom = read_sstable_bloom(&file, &footer)?;
         let index = read_sstable_index(&file, &footer)?;
-        let result = search_sstable(&file, key, &index)?;
+        let result = search_sstable_with_bloom(&file, key, &bloom, &index)?;
 
         return match result {
             Some(val) => Ok(val),

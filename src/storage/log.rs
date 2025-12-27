@@ -4,7 +4,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
 };
 
-use super::skiplist::SkipList;
+use super::{bloom::BloomFilter, skiplist::SkipList};
 
 #[repr(u8)]
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -49,6 +49,7 @@ pub fn store_log(
 
 pub fn flush_memtable(memtable: &mut SkipList) -> Result<(), std::io::Error> {
     // if memtable passed len threshold, flush it into an SSTable file
+    // current threshold is 4KB (25 records of avg 160 bytes)
     if memtable.len() >= 25 {
         let mut file = OpenOptions::new()
             .create(true)
@@ -57,9 +58,12 @@ pub fn flush_memtable(memtable: &mut SkipList) -> Result<(), std::io::Error> {
 
         let data_block_start = file.metadata()?.len();
 
-        // Build index as we write data blocks
+        // Build index and bloom filter as we write data blocks
         let mut index: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
         let mut data_blocks: Vec<u8> = Vec::new();
+
+        // Create Bloom filter with 1% false positive rate
+        let mut bloom_filter = BloomFilter::with_rate(memtable.len(), 0.01);
 
         // Write all records to data blocks and track offsets
         for (key, val) in memtable.iter() {
@@ -67,6 +71,9 @@ pub fn flush_memtable(memtable: &mut SkipList) -> Result<(), std::io::Error> {
 
             // Store key -> offset mapping in index
             index.insert(key.clone(), record_offset);
+
+            // Insert key into Bloom filter
+            bloom_filter.insert(&key);
 
             // Encode the record
             let mut record = match val.0 {
@@ -103,6 +110,15 @@ pub fn flush_memtable(memtable: &mut SkipList) -> Result<(), std::io::Error> {
         // Calculate index block checksum
         let index_checksum = crc32fast::hash(&index_blocks);
 
+        // Write Bloom filter block
+        let bloom_block_start = index_block_end;
+        let bloom_data = bloom_filter.encode();
+        file.write_all(&bloom_data)?;
+        let bloom_block_end = file.metadata()?.len();
+
+        // Calculate bloom filter checksum
+        let bloom_checksum = crc32fast::hash(&bloom_data);
+
         // Write footer
         let footer = SSTableFooter {
             data_block_start,
@@ -110,6 +126,9 @@ pub fn flush_memtable(memtable: &mut SkipList) -> Result<(), std::io::Error> {
             index_block_start,
             index_block_end,
             index_checksum,
+            bloom_block_start,
+            bloom_block_end,
+            bloom_checksum,
         };
 
         file.write_all(&footer.encode())?;
@@ -119,8 +138,15 @@ pub fn flush_memtable(memtable: &mut SkipList) -> Result<(), std::io::Error> {
         memtable.clear();
 
         println!(
-            "Flushed SSTable: data=[{}-{}], index=[{}-{}], index_crc=0x{:X}",
-            data_block_start, data_block_end, index_block_start, index_block_end, index_checksum
+            "Flushed SSTable: data=[{}-{}], index=[{}-{}], bloom=[{}-{}], index_crc=0x{:X}, bloom_crc=0x{:X}",
+            data_block_start,
+            data_block_end,
+            index_block_start,
+            index_block_end,
+            bloom_block_start,
+            bloom_block_end,
+            index_checksum,
+            bloom_checksum
         );
     }
 
@@ -209,10 +235,13 @@ where
 /// - index_block_start: u64 (8 bytes) - where index block starts
 /// - index_block_end: u64 (8 bytes) - where index block ends
 /// - index_checksum: u32 (4 bytes) - CRC32 of index block
+/// - bloom_block_start: u64 (8 bytes) - where bloom filter starts
+/// - bloom_block_end: u64 (8 bytes) - where bloom filter ends
+/// - bloom_checksum: u32 (4 bytes) - CRC32 of bloom filter
 /// - magic_number: u32 (4 bytes) - validation marker (0xDB055555)
 /// - footer_checksum: u32 (4 bytes) - CRC32 of footer data (excluding this field)
-/// Total: 44 bytes
-const FOOTER_SIZE: u64 = 44;
+/// Total: 64 bytes
+const FOOTER_SIZE: u64 = 64;
 const MAGIC_NUMBER: u32 = 0xDB055555;
 
 #[derive(Debug, Clone)]
@@ -222,6 +251,9 @@ pub struct SSTableFooter {
     pub index_block_start: u64,
     pub index_block_end: u64,
     pub index_checksum: u32,
+    pub bloom_block_start: u64,
+    pub bloom_block_end: u64,
+    pub bloom_checksum: u32,
 }
 
 impl SSTableFooter {
@@ -232,6 +264,9 @@ impl SSTableFooter {
         buf.extend_from_slice(&self.index_block_start.to_be_bytes());
         buf.extend_from_slice(&self.index_block_end.to_be_bytes());
         buf.extend_from_slice(&self.index_checksum.to_be_bytes());
+        buf.extend_from_slice(&self.bloom_block_start.to_be_bytes());
+        buf.extend_from_slice(&self.bloom_block_end.to_be_bytes());
+        buf.extend_from_slice(&self.bloom_checksum.to_be_bytes());
         buf.extend_from_slice(&MAGIC_NUMBER.to_be_bytes());
 
         // Calculate checksum of all footer data
@@ -243,7 +278,7 @@ impl SSTableFooter {
 
     pub fn decode<R: Read>(mut reader: R) -> Result<Self, std::io::Error> {
         let mut buf = [0u8; 8];
-        let mut footer_data = Vec::with_capacity(36); // All data except final checksum
+        let mut footer_data = Vec::with_capacity(60); // All data except final checksum
 
         reader.read_exact(&mut buf)?;
         footer_data.extend_from_slice(&buf);
@@ -265,6 +300,18 @@ impl SSTableFooter {
         reader.read_exact(&mut checksum_buf)?;
         footer_data.extend_from_slice(&checksum_buf);
         let index_checksum = u32::from_be_bytes(checksum_buf);
+
+        reader.read_exact(&mut buf)?;
+        footer_data.extend_from_slice(&buf);
+        let bloom_block_start = u64::from_be_bytes(buf);
+
+        reader.read_exact(&mut buf)?;
+        footer_data.extend_from_slice(&buf);
+        let bloom_block_end = u64::from_be_bytes(buf);
+
+        reader.read_exact(&mut checksum_buf)?;
+        footer_data.extend_from_slice(&checksum_buf);
+        let bloom_checksum = u32::from_be_bytes(checksum_buf);
 
         let mut magic_buf = [0u8; 4];
         reader.read_exact(&mut magic_buf)?;
@@ -302,6 +349,9 @@ impl SSTableFooter {
             index_block_start,
             index_block_end,
             index_checksum,
+            bloom_block_start,
+            bloom_block_end,
+            bloom_checksum,
         })
     }
 }
@@ -388,6 +438,36 @@ pub fn read_sstable_index<R: Read + Seek>(
     Ok(index)
 }
 
+/// Read the bloom filter from an SSTable file
+pub fn read_sstable_bloom<R: Read + Seek>(
+    mut reader: R,
+    footer: &SSTableFooter,
+) -> Result<super::bloom::BloomFilter, std::io::Error> {
+    // Calculate bloom filter block size
+    let bloom_size = footer.bloom_block_end - footer.bloom_block_start;
+
+    // Seek to bloom filter block start and read entire block
+    reader.seek(SeekFrom::Start(footer.bloom_block_start))?;
+    let mut bloom_data = vec![0u8; bloom_size as usize];
+    reader.read_exact(&mut bloom_data)?;
+
+    // Verify bloom filter checksum
+    let calculated_checksum = crc32fast::hash(&bloom_data);
+    if calculated_checksum != footer.bloom_checksum {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Bloom filter checksum mismatch: expected 0x{:X}, got 0x{:X}",
+                footer.bloom_checksum, calculated_checksum
+            ),
+        ));
+    }
+
+    // Decode bloom filter
+    let cursor = std::io::Cursor::new(&bloom_data);
+    super::bloom::BloomFilter::decode(cursor)
+}
+
 /// Search for a key in the SSTable using the index
 pub fn search_sstable<R: Read + Seek>(
     mut reader: R,
@@ -411,6 +491,23 @@ pub fn search_sstable<R: Read + Seek>(
     } else {
         Ok(None)
     }
+}
+
+/// Search for a key in the SSTable using bloom filter and index
+/// This is more efficient as it checks the bloom filter first
+pub fn search_sstable_with_bloom<R: Read + Seek>(
+    mut reader: R,
+    key: &[u8],
+    bloom: &super::bloom::BloomFilter,
+    index: &BTreeMap<Vec<u8>, u64>,
+) -> Result<Option<Vec<u8>>, std::io::Error> {
+    // Check bloom filter first - if it returns false, key definitely doesn't exist
+    if !bloom.contains(key) {
+        return Ok(None);
+    }
+
+    // Bloom filter says key might exist, check the index
+    search_sstable(&mut reader, key, index)
 }
 
 #[cfg(test)]
@@ -438,6 +535,9 @@ mod tests {
             index_block_start: 1000,
             index_block_end: 1500,
             index_checksum: 0x12345678,
+            bloom_block_start: 1500,
+            bloom_block_end: 1600,
+            bloom_checksum: 0x87654321,
         };
 
         let encoded = footer.encode();
@@ -449,6 +549,9 @@ mod tests {
         assert_eq!(decoded.index_block_start, footer.index_block_start);
         assert_eq!(decoded.index_block_end, footer.index_block_end);
         assert_eq!(decoded.index_checksum, footer.index_checksum);
+        assert_eq!(decoded.bloom_block_start, footer.bloom_block_start);
+        assert_eq!(decoded.bloom_block_end, footer.bloom_block_end);
+        assert_eq!(decoded.bloom_checksum, footer.bloom_checksum);
     }
 
     #[test]
@@ -494,6 +597,9 @@ mod tests {
             index_block_start: 0, // Index starts at beginning for this test
             index_block_end: index_block.len() as u64,
             index_checksum,
+            bloom_block_start: 0,
+            bloom_block_end: 0,
+            bloom_checksum: 0,
         };
 
         // Decode index
@@ -507,6 +613,7 @@ mod tests {
 
     #[test]
     fn test_sstable_write_and_read() {
+        use crate::storage::bloom::BloomFilter;
         use std::fs::File;
         use std::io::Write;
 
@@ -521,9 +628,10 @@ mod tests {
 
         let data_block_start = 0;
 
-        // Build data and index
+        // Build data, index, and bloom filter
         let mut data_blocks = Vec::new();
         let mut index = BTreeMap::new();
+        let mut bloom_filter = BloomFilter::with_rate(3, 0.01);
 
         // Add some test records
         let test_data = vec![
@@ -535,6 +643,7 @@ mod tests {
         for (key, value) in test_data.iter() {
             let offset = data_block_start + data_blocks.len() as u64;
             index.insert(key.clone(), offset);
+            bloom_filter.insert(key);
 
             let mut record = encode_record(key, value, RecordType::Put);
             data_blocks.append(&mut record);
@@ -562,6 +671,15 @@ mod tests {
         // Calculate index checksum
         let index_checksum = crc32fast::hash(&index_blocks);
 
+        // Write bloom filter
+        let bloom_block_start = index_block_end;
+        let bloom_data = bloom_filter.encode();
+        file.write_all(&bloom_data).unwrap();
+        let bloom_block_end = file.metadata().unwrap().len();
+
+        // Calculate bloom checksum
+        let bloom_checksum = crc32fast::hash(&bloom_data);
+
         // Write footer
         let footer = SSTableFooter {
             data_block_start,
@@ -569,6 +687,9 @@ mod tests {
             index_block_start,
             index_block_end,
             index_checksum,
+            bloom_block_start,
+            bloom_block_end,
+            bloom_checksum,
         };
         file.write_all(&footer.encode()).unwrap();
         file.sync_all().unwrap();
@@ -577,15 +698,16 @@ mod tests {
         // Now read back using search_sstable
         let file = File::open(test_file).unwrap();
         let footer = read_sstable_footer(&file).unwrap();
+        let bloom = read_sstable_bloom(&file, &footer).unwrap();
         let index = read_sstable_index(&file, &footer).unwrap();
 
-        let result = search_sstable(&file, b"banana", &index).unwrap();
+        let result = search_sstable_with_bloom(&file, b"banana", &bloom, &index).unwrap();
         assert_eq!(result, Some(b"yellow fruit".to_vec()));
 
-        let result = search_sstable(&file, b"apple", &index).unwrap();
+        let result = search_sstable_with_bloom(&file, b"apple", &bloom, &index).unwrap();
         assert_eq!(result, Some(b"red fruit".to_vec()));
 
-        let result = search_sstable(&file, b"nonexistent", &index).unwrap();
+        let result = search_sstable_with_bloom(&file, b"nonexistent", &bloom, &index).unwrap();
         assert_eq!(result, None);
 
         // Clean up
@@ -601,6 +723,9 @@ mod tests {
             index_block_start: 1000,
             index_block_end: 1500,
             index_checksum: 0x12345678,
+            bloom_block_start: 1500,
+            bloom_block_end: 1600,
+            bloom_checksum: 0x87654321,
         };
 
         let mut encoded = footer.encode();
@@ -643,6 +768,9 @@ mod tests {
             index_block_start: 0,
             index_block_end: index_block.len() as u64,
             index_checksum: wrong_checksum,
+            bloom_block_start: 0,
+            bloom_block_end: 0,
+            bloom_checksum: 0,
         };
 
         let result = read_sstable_index(Cursor::new(&index_block), &footer);

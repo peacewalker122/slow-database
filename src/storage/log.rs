@@ -47,9 +47,7 @@ pub fn store_log(
     Ok(offset)
 }
 
-pub fn flush_memtable(
-    memtable: &mut SkipList,
-) -> Result<(), std::io::Error> {
+pub fn flush_memtable(memtable: &mut SkipList) -> Result<(), std::io::Error> {
     // if memtable passed len threshold, flush it into an SSTable file
     if memtable.len() >= 25 {
         let mut file = OpenOptions::new()
@@ -58,38 +56,38 @@ pub fn flush_memtable(
             .open("app.db")?;
 
         let data_block_start = file.metadata()?.len();
-        
+
         // Build index as we write data blocks
         let mut index: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
         let mut data_blocks: Vec<u8> = Vec::new();
-        
+
         // Write all records to data blocks and track offsets
         for (key, val) in memtable.iter() {
             let record_offset = data_block_start + data_blocks.len() as u64;
-            
+
             // Store key -> offset mapping in index
             index.insert(key.clone(), record_offset);
-            
+
             // Encode the record
             let mut record = match val.0 {
                 RecordType::Delete => encode_tombstone_record(&key),
                 RecordType::Put => encode_record(&key, &val.1, RecordType::Put),
             };
-            
+
             data_blocks.append(&mut record);
         }
-        
+
         // Write data blocks to file
         file.write_all(&data_blocks)?;
         let data_block_end = file.metadata()?.len();
-        
+
         // Build and write index block
         let index_block_start = data_block_end;
         let mut index_blocks: Vec<u8> = Vec::new();
-        
+
         // Write number of index entries first
         index_blocks.extend_from_slice(&(index.len() as u64).to_be_bytes());
-        
+
         // Write each index entry
         for (key, offset) in index.iter() {
             let entry = IndexEntry {
@@ -98,13 +96,13 @@ pub fn flush_memtable(
             };
             index_blocks.append(&mut entry.encode());
         }
-        
+
         file.write_all(&index_blocks)?;
         let index_block_end = file.metadata()?.len();
-        
+
         // Calculate index block checksum
         let index_checksum = crc32fast::hash(&index_blocks);
-        
+
         // Write footer
         let footer = SSTableFooter {
             data_block_start,
@@ -113,17 +111,17 @@ pub fn flush_memtable(
             index_block_end,
             index_checksum,
         };
-        
+
         file.write_all(&footer.encode())?;
         file.sync_data()?;
-        
+
         // Clear memtable after successful flush
         memtable.clear();
-        
-        println!("Flushed SSTable: data=[{}-{}], index=[{}-{}], index_crc=0x{:X}", 
-                 data_block_start, data_block_end, 
-                 index_block_start, index_block_end,
-                 index_checksum);
+
+        println!(
+            "Flushed SSTable: data=[{}-{}], index=[{}-{}], index_crc=0x{:X}",
+            data_block_start, data_block_end, index_block_start, index_block_end, index_checksum
+        );
     }
 
     Ok(())
@@ -235,64 +233,69 @@ impl SSTableFooter {
         buf.extend_from_slice(&self.index_block_end.to_be_bytes());
         buf.extend_from_slice(&self.index_checksum.to_be_bytes());
         buf.extend_from_slice(&MAGIC_NUMBER.to_be_bytes());
-        
+
         // Calculate checksum of all footer data
         let footer_checksum = crc32fast::hash(&buf);
         buf.extend_from_slice(&footer_checksum.to_be_bytes());
-        
+
         buf
     }
 
     pub fn decode<R: Read>(mut reader: R) -> Result<Self, std::io::Error> {
         let mut buf = [0u8; 8];
         let mut footer_data = Vec::with_capacity(36); // All data except final checksum
-        
+
         reader.read_exact(&mut buf)?;
         footer_data.extend_from_slice(&buf);
         let data_block_start = u64::from_be_bytes(buf);
-        
+
         reader.read_exact(&mut buf)?;
         footer_data.extend_from_slice(&buf);
         let data_block_end = u64::from_be_bytes(buf);
-        
+
         reader.read_exact(&mut buf)?;
         footer_data.extend_from_slice(&buf);
         let index_block_start = u64::from_be_bytes(buf);
-        
+
         reader.read_exact(&mut buf)?;
         footer_data.extend_from_slice(&buf);
         let index_block_end = u64::from_be_bytes(buf);
-        
+
         let mut checksum_buf = [0u8; 4];
         reader.read_exact(&mut checksum_buf)?;
         footer_data.extend_from_slice(&checksum_buf);
         let index_checksum = u32::from_be_bytes(checksum_buf);
-        
+
         let mut magic_buf = [0u8; 4];
         reader.read_exact(&mut magic_buf)?;
         footer_data.extend_from_slice(&magic_buf);
         let magic = u32::from_be_bytes(magic_buf);
-        
+
         if magic != MAGIC_NUMBER {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Invalid magic number: expected 0x{:X}, got 0x{:X}", MAGIC_NUMBER, magic),
+                format!(
+                    "Invalid magic number: expected 0x{:X}, got 0x{:X}",
+                    MAGIC_NUMBER, magic
+                ),
             ));
         }
-        
+
         // Verify footer checksum
         reader.read_exact(&mut checksum_buf)?;
         let stored_checksum = u32::from_be_bytes(checksum_buf);
         let calculated_checksum = crc32fast::hash(&footer_data);
-        
+
         if stored_checksum != calculated_checksum {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Footer checksum mismatch: expected 0x{:X}, got 0x{:X}", 
-                        calculated_checksum, stored_checksum),
+                format!(
+                    "Footer checksum mismatch: expected 0x{:X}, got 0x{:X}",
+                    calculated_checksum, stored_checksum
+                ),
             ));
         }
-        
+
         Ok(SSTableFooter {
             data_block_start,
             data_block_end,
@@ -323,14 +326,14 @@ impl IndexEntry {
         let mut len_buf = [0u8; 8];
         reader.read_exact(&mut len_buf)?;
         let key_len = u64::from_be_bytes(len_buf) as usize;
-        
+
         let mut key = vec![0u8; key_len];
         reader.read_exact(&mut key)?;
-        
+
         let mut offset_buf = [0u8; 8];
         reader.read_exact(&mut offset_buf)?;
         let offset = u64::from_be_bytes(offset_buf);
-        
+
         Ok(IndexEntry { key, offset })
     }
 }
@@ -349,37 +352,39 @@ pub fn read_sstable_index<R: Read + Seek>(
 ) -> Result<BTreeMap<Vec<u8>, u64>, std::io::Error> {
     // Calculate index block size
     let index_size = footer.index_block_end - footer.index_block_start;
-    
+
     // Seek to index block start and read entire block
     reader.seek(SeekFrom::Start(footer.index_block_start))?;
     let mut index_data = vec![0u8; index_size as usize];
     reader.read_exact(&mut index_data)?;
-    
+
     // Verify index checksum
     let calculated_checksum = crc32fast::hash(&index_data);
     if calculated_checksum != footer.index_checksum {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Index block checksum mismatch: expected 0x{:X}, got 0x{:X}", 
-                    footer.index_checksum, calculated_checksum),
+            format!(
+                "Index block checksum mismatch: expected 0x{:X}, got 0x{:X}",
+                footer.index_checksum, calculated_checksum
+            ),
         ));
     }
-    
+
     // Parse index entries
     let mut cursor = std::io::Cursor::new(&index_data);
-    
+
     // Read number of entries
     let mut count_buf = [0u8; 8];
     cursor.read_exact(&mut count_buf)?;
     let entry_count = u64::from_be_bytes(count_buf);
-    
+
     // Read all index entries
     let mut index = BTreeMap::new();
     for _ in 0..entry_count {
         let entry = IndexEntry::decode(&mut cursor)?;
         index.insert(entry.key, entry.offset);
     }
-    
+
     Ok(index)
 }
 
@@ -387,18 +392,13 @@ pub fn read_sstable_index<R: Read + Seek>(
 pub fn search_sstable<R: Read + Seek>(
     mut reader: R,
     key: &[u8],
+    index: &BTreeMap<Vec<u8>, u64>,
 ) -> Result<Option<Vec<u8>>, std::io::Error> {
-    // Read footer
-    let footer = read_sstable_footer(&mut reader)?;
-    
-    // Read index
-    let index = read_sstable_index(&mut reader, &footer)?;
-    
     // Look up key in index
     if let Some(&offset) = index.get(key) {
         // Read the record at the offset
         let record = decode_record(&mut reader, offset)?;
-        
+
         // Verify key matches
         if record.key == key {
             match record.record_type {
@@ -475,7 +475,7 @@ mod tests {
         // Encode index block
         let mut index_block = Vec::new();
         index_block.extend_from_slice(&(index.len() as u64).to_be_bytes());
-        
+
         for (key, offset) in index.iter() {
             let entry = IndexEntry {
                 key: key.clone(),
@@ -520,34 +520,34 @@ mod tests {
             .unwrap();
 
         let data_block_start = 0;
-        
+
         // Build data and index
         let mut data_blocks = Vec::new();
         let mut index = BTreeMap::new();
-        
+
         // Add some test records
         let test_data = vec![
             (b"apple".to_vec(), b"red fruit".to_vec()),
             (b"banana".to_vec(), b"yellow fruit".to_vec()),
             (b"cherry".to_vec(), b"red small fruit".to_vec()),
         ];
-        
+
         for (key, value) in test_data.iter() {
             let offset = data_block_start + data_blocks.len() as u64;
             index.insert(key.clone(), offset);
-            
+
             let mut record = encode_record(key, value, RecordType::Put);
             data_blocks.append(&mut record);
         }
-        
+
         file.write_all(&data_blocks).unwrap();
         let data_block_end = file.metadata().unwrap().len();
-        
+
         // Write index
         let index_block_start = data_block_end;
         let mut index_blocks = Vec::new();
         index_blocks.extend_from_slice(&(index.len() as u64).to_be_bytes());
-        
+
         for (key, offset) in index.iter() {
             let entry = IndexEntry {
                 key: key.clone(),
@@ -555,13 +555,13 @@ mod tests {
             };
             index_blocks.append(&mut entry.encode());
         }
-        
+
         file.write_all(&index_blocks).unwrap();
         let index_block_end = file.metadata().unwrap().len();
-        
+
         // Calculate index checksum
         let index_checksum = crc32fast::hash(&index_blocks);
-        
+
         // Write footer
         let footer = SSTableFooter {
             data_block_start,
@@ -573,19 +573,21 @@ mod tests {
         file.write_all(&footer.encode()).unwrap();
         file.sync_all().unwrap();
         drop(file);
-        
+
         // Now read back using search_sstable
         let file = File::open(test_file).unwrap();
-        
-        let result = search_sstable(&file, b"banana").unwrap();
+        let footer = read_sstable_footer(&file).unwrap();
+        let index = read_sstable_index(&file, &footer).unwrap();
+
+        let result = search_sstable(&file, b"banana", &index).unwrap();
         assert_eq!(result, Some(b"yellow fruit".to_vec()));
-        
-        let result = search_sstable(&file, b"apple").unwrap();
+
+        let result = search_sstable(&file, b"apple", &index).unwrap();
         assert_eq!(result, Some(b"red fruit".to_vec()));
-        
-        let result = search_sstable(&file, b"nonexistent").unwrap();
+
+        let result = search_sstable(&file, b"nonexistent", &index).unwrap();
         assert_eq!(result, None);
-        
+
         // Clean up
         std::fs::remove_file(test_file).unwrap();
     }
@@ -602,34 +604,39 @@ mod tests {
         };
 
         let mut encoded = footer.encode();
-        
+
         // Corrupt the footer checksum (last 4 bytes)
         let len = encoded.len();
         encoded[len - 1] ^= 0xFF; // Flip bits in last byte
-        
+
         let result = SSTableFooter::decode(Cursor::new(&encoded));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Footer checksum mismatch"));
-        
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Footer checksum mismatch")
+        );
+
         // Test index checksum validation
         let mut index = BTreeMap::new();
         index.insert(b"key1".to_vec(), 100u64);
-        
+
         let mut index_block = Vec::new();
         index_block.extend_from_slice(&(index.len() as u64).to_be_bytes());
-        
+
         let entry = IndexEntry {
             key: b"key1".to_vec(),
             offset: 100,
         };
         index_block.append(&mut entry.encode());
-        
+
         // Correct checksum
         let correct_checksum = crc32fast::hash(&index_block);
-        
+
         // Wrong checksum
         let wrong_checksum = correct_checksum ^ 0xFFFF;
-        
+
         let footer = SSTableFooter {
             data_block_start: 0,
             data_block_end: 1000,
@@ -637,9 +644,14 @@ mod tests {
             index_block_end: index_block.len() as u64,
             index_checksum: wrong_checksum,
         };
-        
+
         let result = read_sstable_index(Cursor::new(&index_block), &footer);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Index block checksum mismatch"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Index block checksum mismatch")
+        );
     }
 }

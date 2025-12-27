@@ -5,7 +5,7 @@ use crate::{
     error::DBError,
     storage::{
         self,
-        log::{RecordType, decode_record},
+        log::{RecordType, decode_record, read_sstable_footer, read_sstable_index, search_sstable},
         skiplist::SkipList,
     },
 };
@@ -27,38 +27,41 @@ impl PersistentKV {
 
 impl KVEngine for PersistentKV {
     fn get(&self, key: &[u8]) -> Result<Vec<u8>, DBError> {
-        let offset = self.store.get(key);
+        // search on memtable first, if not found search on file
+        if let Some((record_type, value)) = self.memtable.get(key) {
+            match record_type {
+                RecordType::Put => return Ok(value),
+                RecordType::Delete => return Ok(vec![]), // empty
+            }
+        }
+        let file = File::open("app.db")?;
+        let footer = read_sstable_footer(&file)?;
+        let index = read_sstable_index(&file, &footer)?;
+        let result = search_sstable(&file, key, &index)?;
 
-        let file = File::open("app.log")?;
-
-        // linearly search the file
-        let result = decode_record(file, *offset.ok_or_else(|| DBError::NotFound)?)?;
-
-        return Ok(result.val);
+        return match result {
+            Some(val) => Ok(val),
+            None => Ok(vec![]),
+        };
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), DBError> {
-        let offset = storage::log::store_log("app.log", key, value, RecordType::Put)?;
+        storage::log::store_log("app.log", key, value, RecordType::Put)?; // WAL
+        self.memtable
+            .insert(key.to_vec(), (RecordType::Put, value.to_vec()));
 
-        self.store.insert(key.to_vec(), offset);
-        self.memtable.insert(key.to_vec(), (RecordType::Put, value.to_vec()));
-
-        storage::log::flush_memtable(&mut self.memtable)?;
+        storage::log::flush_memtable(&mut self.memtable)?; // flush to SSTable when certain size reached
         Ok(())
     }
 
     fn delete(&mut self, key: &[u8]) {
-        // TODO: handle to remove the file into the log.
-        self.store.remove(key);
+        self.memtable
+            .insert(key.to_vec(), (RecordType::Delete, vec![]));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-
-    use crate::storage::log::decode_record;
-
     use super::*;
 
     #[test]
@@ -81,41 +84,9 @@ mod tests {
         // --- assert not found ---
         let result = kv.get(b"key1");
         assert!(
-            matches!(result, Err(DBError::NotFound)),
+            matches!(result.as_deref(), Ok([])),
             "expected NotFound, got: {:?}",
             result
         );
-    }
-
-    #[test]
-    fn test_integration_decode_log() {
-        let mut kv = PersistentKV::new();
-        for i in 0..100 {
-            kv.put(
-                format!("key{i}").as_bytes(),
-                &format!("value{i}").as_bytes(),
-            )
-            .unwrap();
-        }
-
-        let file = File::open("app.log").unwrap();
-        // from the record we need to find key99
-        let mut found = false;
-        let offset = kv
-            .store
-            .get("key44".as_bytes())
-            .expect("harusnya ada sihhh");
-
-        let result = decode_record(&file, *offset).unwrap();
-        println!("got value: {:?}", result);
-
-        // check the value
-        if result.key == b"key44" {
-            println!("offset were found at: {:?}", result);
-            assert_eq!(result.val, b"value44");
-            found = true;
-        }
-
-        assert_eq!(found, true)
     }
 }

@@ -32,7 +32,7 @@ impl Node {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SkipList {
     head: Rc<RefCell<Node>>,
     level: usize,

@@ -133,10 +133,20 @@ This roadmap is language-agnostic but optimized for **Rust-first** with optional
 * Bloom filters
 
 ### Implementation
-
 * 4KB blocks
-* Block checksums
+    - Question is, how do we track the size of each insertion of data here? 
+        - Atomic Counter for each data insertion, process the key + data. How to maintain the consistency of the block that won't be exceed the given size
 * Sparse index
+    - Index that stored the range of value information, so when there's fetch of data came, it check the index first, check the key range from the blocks and then linearly scan the block since the cardinality is low. 
+
+### Challenge
+If we trying to implement block in our database, think about the case where the key is having high cardinality. If we trying to built the index using it. How the index would be maintained?
+
+To introduce, lets quantify how bad is "random" and "unpredictable" key to our database. Start with the block, we expect the block to contains an ordered key, for example: `testkey:1`, `testkey:2`, and so on. But if we put uuid to it such as `40c0794d-33a0-4a8b-8eef-ce2129452b68` it will made an overhead to the block and the index. on the first example we can compacted it into 1 block with 1 corresponding index. But on the second example it will add N blocks and N indexes.
+
+So for example, we have an 100.000 incoming request, 40% Of it is ordered key, assume that the key and value only took approximately ~200 Bytes, with an block that only have 4KB in size, it will made ~200 blocks. And for the remainder 60% it will took 60.000 Different blocks ands indexes. 
+
+So to solve this, we still using blocks and sparse index, the blocks still do their things, to store the keys and their value. While the index is storing the first value within the block.
 
 ### Zig Exercise (Optional)
 
@@ -154,8 +164,8 @@ This roadmap is language-agnostic but optimized for **Rust-first** with optional
 
 ### Implementation
 
-* Level 0 → Level 1 compaction
-* Delete handling
+* Level 0 → Level 1 compaction.
+* Delete handling.
 
 ### Deliverable
 

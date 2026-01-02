@@ -541,13 +541,26 @@ pub fn search_sstable_sparse<R: Read + Seek>(
     key: &[u8],
     sparse_index: &[SparseIndexEntry],
 ) -> Result<Option<Vec<u8>>, std::io::Error> {
-    // Find the block that might contain the key
+    // Find the block that might contain the key using binary search
     // We need to find the block where: first_key <= key <= last_key
     let mut target_block: Option<&SparseIndexEntry> = None;
 
-    for entry in sparse_index {
-        // Key must be >= first_key and <= last_key
-        if key >= entry.first_key.as_slice() && key <= entry.last_key.as_slice() {
+    // Binary search for the correct block
+    let mut left = 0;
+    let mut right = sparse_index.len();
+
+    while left < right {
+        let mid = left + (right - left) / 2;
+        let entry = &sparse_index[mid];
+
+        if key < entry.first_key.as_slice() {
+            // Key is before this block
+            right = mid;
+        } else if key > entry.last_key.as_slice() {
+            // Key is after this block
+            left = mid + 1;
+        } else {
+            // Key is within this block's range (first_key <= key <= last_key)
             target_block = Some(entry);
             break;
         }

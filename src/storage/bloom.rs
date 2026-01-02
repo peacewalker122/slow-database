@@ -11,6 +11,7 @@ pub struct BloomFilter {
     filter: BF,
     bitmap_size: usize,
     num_hashes: u32,
+
     // Store inserted keys for serialization/deserialization
     keys: Vec<Vec<u8>>,
 }

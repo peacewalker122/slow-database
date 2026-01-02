@@ -138,6 +138,11 @@ This roadmap is language-agnostic but optimized for **Rust-first** with optional
         - Atomic Counter for each data insertion, process the key + data. How to maintain the consistency of the block that won't be exceed the given size
 * Sparse index
     - Index that stored the range of value information, so when there's fetch of data came, it check the index first, check the key range from the blocks and then linearly scan the block since the cardinality is low. 
+    - Index will be implemented as "list", for increasing the locality. For example each index contains few metadata:
+        - first_key & last_key ~= 30-40 Bytes
+        - block_offset = 8 bytes
+        - record_count = 4 bytes
+    And for example there's 100.000 data that were stored included the tombstone. Furthermore, if the average of the data we need to store is ~= 200 Bytes and each block store 4KB of data, each block will stored ~20 Data and there will be 5000 different index data for it using that metadata schema, approximately the index would add overhead arround 11.2 MB. 
 
 ### Challenge
 If we trying to implement block in our database, think about the case where the key is having high cardinality. If we trying to built the index using it. How the index would be maintained?

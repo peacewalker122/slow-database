@@ -3,11 +3,13 @@ use std::io::Write;
 
 // Re-export types from sub-modules for backward compatibility
 pub use super::block::{Block, BlockBuilder};
-pub use super::record::{decode_record, encode_record, encode_tombstone_record, DecodeRecordResult, RecordType};
+pub use super::record::{
+    decode_record, encode_record, encode_tombstone_record, DecodeRecordResult, RecordType,
+};
 pub use super::sstable::{
     flush_memtable, read_sstable_bloom, read_sstable_footer, read_sstable_index,
-    read_sstable_sparse_index, search_sstable, search_sstable_sparse,
-    search_sstable_with_bloom, IndexEntry, SparseIndexEntry, SSTableFooter,
+    read_sstable_sparse_index, search_sstable, search_sstable_sparse, search_sstable_with_bloom,
+    IndexEntry, SSTableFooter, SparseIndexEntry,
 };
 
 /// Store a log entry to the Write-Ahead Log (WAL)
@@ -52,7 +54,7 @@ mod tests {
     #[test]
     fn test_store_and_decode_log() {
         let test_file = "test_wal.log";
-        
+
         // Clean up any existing test file
         let _ = std::fs::remove_file(test_file);
 
@@ -75,7 +77,7 @@ mod tests {
     #[test]
     fn test_store_tombstone() {
         let test_file = "test_wal_tombstone.log";
-        
+
         // Clean up any existing test file
         let _ = std::fs::remove_file(test_file);
 

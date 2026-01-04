@@ -167,14 +167,110 @@ So to solve this, we still using blocks and sparse index, the blocks still do th
 * Tombstones
 * Space amplification
 
-### Implementation
+### Current Problem
 
-* Level 0 → Level 1 compaction.
-* Delete handling.
+The current implementation appends each memtable flush as a new SSTable section to `app.db`. This creates multiple SSTable "generations" in the same file, but only the **last** footer is readable. This means:
+- Older data from previous flushes becomes inaccessible
+- The `test_active_data` test fails because `key88` from an earlier flush cannot be found
+- Disk space grows unbounded without reclaiming deleted keys
+
+### Implementation Strategy: Compaction on Flush
+
+Instead of implementing a full LSM-tree with multiple levels, we start with **simple compaction on every flush**:
+
+#### Step 1: Read Existing SSTable
+- Check if `app.db` exists
+- If yes, read all records from the existing SSTable:
+  - Read footer to locate data blocks
+  - Read bloom filter and sparse index
+  - Iterate through all blocks sequentially
+  - Collect all key-value pairs into a temporary structure (BTreeMap for sorting)
+
+#### Step 2: Merge with Memtable
+- Combine existing SSTable data with new memtable data
+- Merge strategy (newest wins):
+  ```
+  for each key:
+    if key in memtable: use memtable value (newer)
+    else if key in old_sstable: use old_sstable value
+  ```
+- Handle tombstones (RecordType::Delete):
+  - If memtable has Delete for a key, remove that key entirely from merged result
+  - Don't carry forward Delete tombstones from old SSTable (they've done their job)
+
+#### Step 3: Write Merged SSTable
+- Replace `app.db` with the merged result:
+  - Write to temporary file `app.db.tmp`
+  - Use existing `flush_memtable` logic (blocks, sparse index, bloom filter, footer)
+  - Rename `app.db.tmp` → `app.db` (atomic on most filesystems)
+- This ensures we never have corrupt intermediate states
+
+#### Step 4: Helper Functions Needed
+
+```rust
+// Read all records from existing SSTable into BTreeMap
+pub fn read_all_sstable_records(file_path: &str) 
+    -> Result<BTreeMap<Vec<u8>, (RecordType, Vec<u8>)>, std::io::Error>
+
+// Merge old SSTable data with new memtable, handling tombstones
+pub fn merge_with_compaction(
+    old_data: BTreeMap<Vec<u8>, (RecordType, Vec<u8>)>,
+    new_memtable: &SkipList
+) -> BTreeMap<Vec<u8>, (RecordType, Vec<u8>)>
+
+// Modified flush that does compaction
+pub fn flush_memtable_with_compaction(
+    memtable: SkipList, 
+    db_path: &str
+) -> Result<(), std::io::Error>
+```
+
+### Trade-offs & Considerations
+
+**Pros:**
+- Simple implementation (no level management)
+- Always have exactly one SSTable per file
+- All data remains accessible
+- Tombstones are cleaned up immediately
+- Bounded disk usage
+
+**Cons:**
+- Write amplification: O(n) on every flush (read entire SSTable, rewrite everything)
+- Not suitable for large databases (>1GB)
+- No background compaction (blocks writes during compaction)
+
+**Future Optimizations (Phase 6.5+):**
+- Multi-level LSM: L0 → L1 → L2 with size-tiered compaction
+- Background compaction thread
+- Incremental merge (don't rewrite entire SSTable)
+- Multiple SSTable files with manifest tracking
+
+### Implementation Details
+
+#### Tombstone Handling
+- **During Merge:** If memtable has `Delete(key)`, remove `key` from result entirely
+- **Old Tombstones:** Don't preserve Delete records from old SSTable (space reclamation)
+- **Correctness:** Since we only have one SSTable, tombstones can be removed after merge
+
+#### Atomicity
+- Write to `app.db.tmp` first
+- Only rename to `app.db` after successful write and fsync
+- On crash, either old `app.db` exists (valid) or new one exists (valid)
+- Never have partial/corrupt SSTable
+
+#### Testing Strategy
+1. Test single flush (baseline)
+2. Test multiple flushes with reads (verify all data accessible)
+3. Test tombstone handling (deleted keys don't appear after compaction)
+4. Test crash during compaction (atomic rename)
+5. Make `test_active_data` pass (key88 should be found)
 
 ### Deliverable
 
 * Bounded disk usage
+* All flushed data remains accessible across multiple flushes
+* Tombstone cleanup and space reclamation
+* `test_active_data` test passes
 
 ---
 

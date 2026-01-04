@@ -1,2 +1,2 @@
-pub const MEMTABLE_SIZE_THRESHOLD: u64 = 4096000; // 4MB
+pub const MEMTABLE_SIZE_THRESHOLD: u64 = 40960; // 4oKB
 pub const SSTABLE_BLOCK_SIZE: usize = 4096; // 4KB

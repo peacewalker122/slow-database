@@ -7,7 +7,7 @@ use std::{
 use super::{
     block::BlockBuilder,
     bloom::BloomFilter,
-    record::{RecordType, decode_record, encode_record, encode_tombstone_record},
+    record::{decode_record, encode_record, encode_tombstone_record, RecordType},
     skiplist::SkipList,
 };
 
@@ -269,16 +269,28 @@ fn verify_bloom_checksum(data: &[u8], expected: u32) -> Result<(), std::io::Erro
 }
 
 /// Flush memtable to SSTable with 4KB blocks
-pub fn flush_memtable(memtable: SkipList) -> Result<(), std::io::Error> {
+///
+/// # Arguments
+/// * `memtable` - The memtable to flush
+/// * `level` - The LSM-tree level (0 for memtable flushes, 1+ for compaction)
+/// * `file_id` - Unique identifier for this SSTable file (typically timestamp)
+///
+/// # File Naming Convention
+/// Files are named as: `app-L{level}-{file_id}.db`
+/// Example: `app-L0-1735948800.db` for a Level 0 SSTable with timestamp ID
+pub fn flush_memtable(memtable: SkipList, level: u32, file_id: u64) -> Result<(), std::io::Error> {
+    let filename = format!("app-L{}-{}.db", level, file_id);
+
     log::info!(
-        "Starting memtable flush to SSTable with 4KB blocks, entries: {}",
+        "Starting memtable flush to SSTable '{}' with 4KB blocks, entries: {}",
+        filename,
         memtable.len()
     );
 
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open("app.db")?;
+        .open(&filename)?;
 
     let data_block_start = file.metadata()?.len();
 
@@ -423,7 +435,8 @@ pub fn flush_memtable(memtable: SkipList) -> Result<(), std::io::Error> {
     file.sync_data()?;
 
     log::info!(
-        "Flushed SSTable: {} blocks, data=[{}-{}], sparse_index=[{}-{}], bloom=[{}-{}], index_crc=0x{:X}, bloom_crc=0x{:X}",
+        "Flushed SSTable '{}': {} blocks, data=[{}-{}], sparse_index=[{}-{}], bloom=[{}-{}], index_crc=0x{:X}, bloom_crc=0x{:X}",
+        filename,
         blocks.len(),
         data_block_start,
         data_block_end,
@@ -775,12 +788,10 @@ mod tests {
 
         let result = SSTableFooter::decode(Cursor::new(&encoded));
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Footer checksum mismatch")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Footer checksum mismatch"));
 
         // Test index checksum validation
         let mut index = BTreeMap::new();
@@ -814,11 +825,9 @@ mod tests {
 
         let result = read_sstable_index(Cursor::new(&index_block), &footer);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Index block checksum mismatch")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Index block checksum mismatch"));
     }
 }

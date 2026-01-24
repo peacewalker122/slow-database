@@ -2,14 +2,82 @@ use std::{
     collections::BTreeMap,
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
+    ops::Deref,
 };
 
-use super::{
-    block::BlockBuilder,
-    bloom::BloomFilter,
-    record::{decode_record, encode_record, encode_tombstone_record, RecordType},
-    skiplist::SkipList,
-};
+use crossbeam_skiplist::SkipMap;
+
+use crate::storage::log::Record;
+
+use super::{block::BlockBuilder, bloom::BloomFilter, record::RecordType};
+
+struct SSTable {
+    block: Vec<BlockBuilder>,
+    index: Vec<IndexEntry>,
+    bloom: BloomFilter,
+    footer: SSTableFooter,
+}
+
+impl SSTable {
+    pub fn decode(data: Vec<u8>) -> Result<Self, std::io::Error> {
+        let mut cursor = std::io::Cursor::new(&data);
+
+        // Read footer
+        cursor.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
+        let footer = SSTableFooter::decode(&mut cursor)?;
+
+        let mut block = Vec::new();
+        let mut block_data = vec![0u8; (footer.data_block_end - footer.data_block_start) as usize];
+        cursor.seek(SeekFrom::Start(footer.data_block_start))?;
+        cursor.read_exact(&mut block_data)?;
+
+        // parse the data blocks
+
+        // Read index block
+        cursor.seek(SeekFrom::Start(footer.index_block_start))?;
+        let mut index_data =
+            vec![0u8; (footer.index_block_end - footer.index_block_start) as usize];
+        cursor.read_exact(&mut index_data)?;
+
+        // Verify index checksum
+        verify_index_checksum(&index_data, footer.index_checksum)?;
+
+        // Parse index entries
+        let mut index_cursor = std::io::Cursor::new(&index_data);
+        let mut index = Vec::new();
+
+        // Read number of entries
+        let mut count_buf = [0u8; 8];
+        index_cursor.read_exact(&mut count_buf)?;
+        let entry_count = u64::from_be_bytes(count_buf);
+
+        // Read all index entries
+        for _ in 0..entry_count {
+            let entry = IndexEntry::decode(&mut index_cursor)?;
+            index.push(entry);
+        }
+
+        // Read bloom filter block
+        cursor.seek(SeekFrom::Start(footer.bloom_block_start))?;
+        let mut bloom_data =
+            vec![0u8; (footer.bloom_block_end - footer.bloom_block_start) as usize];
+        cursor.read_exact(&mut bloom_data)?;
+
+        // Verify bloom filter checksum
+        verify_bloom_checksum(&bloom_data, footer.bloom_checksum)?;
+
+        // Decode bloom filter
+        let bloom_cursor = std::io::Cursor::new(&bloom_data);
+        let bloom = BloomFilter::decode(bloom_cursor)?;
+
+        Ok(SSTable {
+            block,
+            index,
+            bloom,
+            footer,
+        })
+    }
+}
 
 /// SSTable Footer Structure:
 /// - data_block_start: u64 (8 bytes) - where data blocks start
@@ -278,7 +346,11 @@ fn verify_bloom_checksum(data: &[u8], expected: u32) -> Result<(), std::io::Erro
 /// # File Naming Convention
 /// Files are named as: `app-L{level}-{file_id}.db`
 /// Example: `app-L0-1735948800.db` for a Level 0 SSTable with timestamp ID
-pub fn flush_memtable(memtable: SkipList, level: u32, file_id: u64) -> Result<(), std::io::Error> {
+pub fn flush_memtable(
+    memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)>,
+    level: u32,
+    file_id: u64,
+) -> Result<(), std::io::Error> {
     let filename = format!("app-L{}-{}.db", level, file_id);
 
     log::info!(
@@ -308,18 +380,21 @@ pub fn flush_memtable(memtable: SkipList, level: u32, file_id: u64) -> Result<()
     log::debug!("Writing records to 4KB blocks...");
 
     // Write all records to blocks
-    for (key, val) in memtable.iter() {
-        // Insert key into Bloom filter
-        bloom_filter.insert(&key);
+    for entry in memtable.iter() {
+        let key = entry.key();
+        let val = entry.value();
 
-        // Encode the record
+        // Insert key into Bloom filter
+        bloom_filter.insert(key);
+
+        // Encode the record with sequential LSN
         let record = match val.0 {
-            RecordType::Delete => encode_tombstone_record(&key),
-            RecordType::Put => encode_record(&key, &val.1, RecordType::Put),
+            RecordType::Delete => Record::new(key, &val.1, RecordType::Delete),
+            RecordType::Put => Record::new(key, &val.1, RecordType::Put),
         };
 
         // Try to add record to current block
-        match block_builder.add_record(record.clone(), key.clone()) {
+        match block_builder.add_record(&record) {
             Ok(()) => {
                 // Record added successfully
             }
@@ -351,7 +426,7 @@ pub fn flush_memtable(memtable: SkipList, level: u32, file_id: u64) -> Result<()
                 // Create new block and add the record that didn't fit
                 block_builder = BlockBuilder::new(current_offset);
                 block_builder
-                    .add_record(record, key.clone())
+                    .add_record(&record)
                     .expect("Fresh block should have space for record");
             }
         }
@@ -547,6 +622,63 @@ pub fn read_sstable_bloom<R: Read + Seek>(
     BloomFilter::decode(cursor)
 }
 
+/// Helper function to decode a record from a File/generic reader at an offset
+/// This reads the data into a buffer then decodes using Record::decode
+fn decode_record_from_file<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+) -> Result<(Vec<u8>, Vec<u8>, RecordType, u64), std::io::Error> {
+    reader.seek(SeekFrom::Start(offset))?;
+
+    // Read record type
+    let mut record_type_buf = [0u8; 1];
+    reader.read_exact(&mut record_type_buf)?;
+    let record_type = match record_type_buf[0] {
+        1 => RecordType::Put,
+        2 => RecordType::Delete,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid record type",
+            ));
+        }
+    };
+
+    // Read key length
+    let mut len_buf = [0u8; 8];
+    reader.read_exact(&mut len_buf)?;
+    let key_len = u64::from_be_bytes(len_buf) as usize;
+
+    // Read value length
+    reader.read_exact(&mut len_buf)?;
+    let value_len = u64::from_be_bytes(len_buf) as usize;
+
+    // Read key
+    let mut key = vec![0u8; key_len];
+    reader.read_exact(&mut key)?;
+
+    // Read value
+    let mut value = vec![0u8; value_len];
+    reader.read_exact(&mut value)?;
+
+    // Read and verify checksum
+    let mut checksum_buf = [0u8; 4];
+    reader.read_exact(&mut checksum_buf)?;
+    let checksum = u32::from_be_bytes(checksum_buf);
+
+    if crc32fast::hash(&value) != checksum {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Checksum mismatch",
+        ));
+    }
+
+    // Calculate next offset
+    let next_offset = offset + 1 + 8 + 8 + key_len as u64 + value_len as u64 + 4;
+
+    Ok((key, value, record_type, next_offset))
+}
+
 /// Search for a key in the SSTable using sparse index and linear block scan
 /// This is optimized for high-cardinality keys (like UUIDs)
 pub fn search_sstable_sparse<R: Read + Seek>(
@@ -600,21 +732,21 @@ pub fn search_sstable_sparse<R: Read + Seek>(
 
     loop {
         // Try to read a record at current offset
-        match decode_record(&mut reader, current_offset) {
-            Ok(record) => {
+        match decode_record_from_file(&mut reader, current_offset) {
+            Ok((record_key, record_value, record_type, next_offset)) => {
                 records_scanned += 1;
 
                 // Check if this is our key
-                if record.key == key {
+                if record_key.as_slice() == key {
                     log::trace!("Key found after scanning {} records", records_scanned);
-                    return match record.record_type {
-                        RecordType::Put => Ok(Some(record.val)),
+                    return match record_type {
+                        RecordType::Put => Ok(Some(record_value)),
                         RecordType::Delete => Ok(None), // Tombstone
                     };
                 }
 
                 // Move to next record
-                current_offset = record.offset;
+                current_offset = next_offset;
 
                 // If we've scanned all records in this block, stop
                 if records_scanned >= block.record_count {
@@ -644,12 +776,13 @@ pub fn search_sstable<R: Read + Seek>(
     // Look up key in index
     if let Some(&offset) = index.get(key) {
         // Read the record at the offset
-        let record = decode_record(&mut reader, offset)?;
+        let (record_key, record_value, record_type, _next_offset) =
+            decode_record_from_file(&mut reader, offset)?;
 
         // Verify key matches
-        if record.key == key {
-            match record.record_type {
-                RecordType::Put => Ok(Some(record.val)),
+        if record_key.as_slice() == key {
+            match record_type {
+                RecordType::Put => Ok(Some(record_value)),
                 RecordType::Delete => Ok(None), // Tombstone
             }
         } else {
@@ -788,10 +921,12 @@ mod tests {
 
         let result = SSTableFooter::decode(Cursor::new(&encoded));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Footer checksum mismatch"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Footer checksum mismatch")
+        );
 
         // Test index checksum validation
         let mut index = BTreeMap::new();
@@ -825,9 +960,11 @@ mod tests {
 
         let result = read_sstable_index(Cursor::new(&index_block), &footer);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Index block checksum mismatch"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Index block checksum mismatch")
+        );
     }
 }

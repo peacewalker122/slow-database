@@ -7,6 +7,7 @@ use std::io::Read;
 /// Note: This implementation stores the bloom filter parameters for reconstruction
 /// but doesn't serialize the actual filter state. For production use, you may want
 /// to implement proper serialization or use a different bloom filter library.
+
 pub struct BloomFilter {
     filter: BF,
     bitmap_size: usize,

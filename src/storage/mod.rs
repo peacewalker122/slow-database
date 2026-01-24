@@ -5,5 +5,5 @@ pub mod kv;
 pub mod log;
 pub mod manifest;
 pub mod record;
-pub mod skiplist;
 pub mod sstable;
+pub mod wal;

@@ -2,36 +2,37 @@ use std::{
     collections::BTreeMap,
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
-    ops::Deref,
 };
 
 use crossbeam_skiplist::SkipMap;
 
-use crate::storage::log::Record;
+use crate::{
+    error::DBError,
+    storage::log::{Block, Record},
+};
 
 use super::{block::BlockBuilder, bloom::BloomFilter, record::RecordType};
 
+#[derive(Debug)]
 struct SSTable {
-    block: Vec<BlockBuilder>,
-    index: Vec<IndexEntry>,
+    block: Vec<Block>,
+    index: Vec<SparseIndexEntry>,
     bloom: BloomFilter,
     footer: SSTableFooter,
 }
 
 impl SSTable {
-    pub fn decode(data: Vec<u8>) -> Result<Self, std::io::Error> {
-        let mut cursor = std::io::Cursor::new(&data);
+    pub fn decode(data: &[u8]) -> Result<Self, DBError> {
+        let mut cursor = std::io::Cursor::new(data);
 
         // Read footer
         cursor.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
         let footer = SSTableFooter::decode(&mut cursor)?;
 
-        let mut block = Vec::new();
+        let mut blocks = Vec::new();
         let mut block_data = vec![0u8; (footer.data_block_end - footer.data_block_start) as usize];
         cursor.seek(SeekFrom::Start(footer.data_block_start))?;
         cursor.read_exact(&mut block_data)?;
-
-        // parse the data blocks
 
         // Read index block
         cursor.seek(SeekFrom::Start(footer.index_block_start))?;
@@ -53,8 +54,15 @@ impl SSTable {
 
         // Read all index entries
         for _ in 0..entry_count {
-            let entry = IndexEntry::decode(&mut index_cursor)?;
+            let entry = SparseIndexEntry::decode(&mut index_cursor)?;
+            let offset = entry.block_offset;
             index.push(entry);
+
+            // start from the offset. On each offset we decode the heeader -> parse block data in
+            // return we will get the key-value pairs on what we already stored
+            let block = Block::decode(&mut cursor, offset)?;
+
+            blocks.push(block);
         }
 
         // Read bloom filter block
@@ -71,7 +79,7 @@ impl SSTable {
         let bloom = BloomFilter::decode(bloom_cursor)?;
 
         Ok(SSTable {
-            block,
+            block: blocks,
             index,
             bloom,
             footer,
@@ -965,6 +973,386 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Index block checksum mismatch")
+        );
+    }
+
+    #[test]
+    fn test_sstable_decode_valid() {
+        // Test decoding a valid SSTable with multiple entries
+        // Create a memtable with test data
+        let memtable = SkipMap::new();
+        memtable.insert(b"apple".to_vec(), (RecordType::Put, b"red".to_vec()));
+        memtable.insert(b"banana".to_vec(), (RecordType::Put, b"yellow".to_vec()));
+        memtable.insert(b"cherry".to_vec(), (RecordType::Put, b"red".to_vec()));
+
+        // Use flush_memtable to create SSTable
+        let file_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let filename = format!("app-L0-{}.db", file_id);
+
+        flush_memtable(memtable, 0, file_id).unwrap();
+
+        // Read the file back
+        let sstable_data = std::fs::read(&filename).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
+
+        // Decode SSTable
+        let decoded = SSTable::decode(&sstable_data).unwrap();
+
+        // Verify decoded structure
+        assert_eq!(decoded.block.len(), 1, "Should have exactly one block");
+        assert_eq!(
+            decoded.index.len(),
+            1,
+            "Should have exactly one index entry"
+        );
+
+        // Verify block metadata
+        let block = &decoded.block[0];
+        assert_eq!(block.first_key, b"apple", "First key should be 'apple'");
+        assert_eq!(
+            block.last_key, b"cherry",
+            "Last key should be 'cherry' (sorted order)"
+        );
+        assert_eq!(block.record_count, 3, "Block should contain 3 records");
+        assert!(block.data_size > 0, "Block should have data");
+
+        // Verify index entry points to the block
+        let index_entry = &decoded.index[0];
+        assert_eq!(
+            index_entry.first_key, b"apple",
+            "Index first_key should match block"
+        );
+        assert_eq!(
+            index_entry.last_key, b"cherry",
+            "Index last_key should match block"
+        );
+        assert_eq!(
+            index_entry.block_offset, block.offset,
+            "Index should point to block offset"
+        );
+        assert_eq!(
+            index_entry.record_count, 3,
+            "Index record_count should match block"
+        );
+
+        // Verify bloom filter contains our keys
+        assert!(decoded.bloom.contains(b"apple"));
+        assert!(decoded.bloom.contains(b"banana"));
+        assert!(decoded.bloom.contains(b"cherry"));
+    }
+
+    #[test]
+    fn test_sstable_decode_single_block() {
+        // Test decoding an SSTable with a single entry
+        let memtable = SkipMap::new();
+        memtable.insert(b"key".to_vec(), (RecordType::Put, b"value".to_vec()));
+
+        // Use flush_memtable to create SSTable
+        let file_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let filename = format!("app-L0-{}.db", file_id);
+
+        flush_memtable(memtable, 0, file_id).unwrap();
+
+        // Read the file back
+        let sstable_data = std::fs::read(&filename).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
+
+        // Decode SSTable
+        let decoded = SSTable::decode(&sstable_data).unwrap();
+
+        // Verify decoded structure
+        assert_eq!(decoded.block.len(), 1, "Should have exactly one block");
+        assert_eq!(
+            decoded.index.len(),
+            1,
+            "Should have exactly one index entry"
+        );
+
+        // Verify block metadata
+        let block = &decoded.block[0];
+        assert_eq!(block.first_key, b"key", "First key should be 'key'");
+        assert_eq!(block.last_key, b"key", "Last key should be 'key'");
+        assert_eq!(block.record_count, 1, "Block should contain 1 record");
+        assert!(block.data_size > 0, "Block should have data");
+
+        // Verify index entry points to the block
+        let index_entry = &decoded.index[0];
+        assert_eq!(
+            index_entry.first_key, b"key",
+            "Index first_key should match block"
+        );
+        assert_eq!(
+            index_entry.last_key, b"key",
+            "Index last_key should match block"
+        );
+        assert_eq!(
+            index_entry.block_offset, block.offset,
+            "Index should point to block offset"
+        );
+        assert_eq!(
+            index_entry.record_count, 1,
+            "Index record_count should match block"
+        );
+
+        // Verify bloom filter
+        assert!(decoded.bloom.contains(b"key"));
+    }
+
+    #[test]
+    fn test_sstable_decode_empty_sstable() {
+        // Test decoding an SSTable with no entries (valid structure but empty)
+        let memtable = SkipMap::new();
+        // Don't insert anything - empty memtable
+
+        // Use flush_memtable to create SSTable
+        let file_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let filename = format!("app-L0-{}.db", file_id);
+
+        flush_memtable(memtable, 0, file_id).unwrap();
+
+        // Read the file back
+        let sstable_data = std::fs::read(&filename).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
+
+        // Decode SSTable
+        let decoded = SSTable::decode(&sstable_data).unwrap();
+
+        // Verify empty structure
+        assert_eq!(decoded.block.len(), 0, "Should have no blocks");
+        assert_eq!(decoded.index.len(), 0, "Should have no index entries");
+    }
+
+    #[test]
+    fn test_sstable_decode_corrupted_index_checksum() {
+        // Test that corrupted index checksum causes decode to fail
+        let memtable = SkipMap::new();
+        memtable.insert(b"key".to_vec(), (RecordType::Put, b"value".to_vec()));
+
+        // Use flush_memtable to create valid SSTable
+        let file_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let filename = format!("app-L0-{}.db", file_id);
+
+        flush_memtable(memtable, 0, file_id).unwrap();
+
+        // Read the file back
+        let mut sstable_data = std::fs::read(&filename).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
+
+        // Read footer to find index checksum location
+        let footer_offset = sstable_data.len() - FOOTER_SIZE as usize;
+        let footer_data = &sstable_data[footer_offset..];
+        let mut cursor = std::io::Cursor::new(footer_data);
+        let footer = SSTableFooter::decode(&mut cursor).unwrap();
+
+        // Corrupt the index checksum in the footer (offset 32 in footer: 4 u64s = 32 bytes)
+        let checksum_offset = footer_offset + 32;
+        sstable_data[checksum_offset] ^= 0xFF; // Flip bits
+
+        // Decode should fail with IO error (checksum validation happens in verify_index_checksum)
+        let result = SSTable::decode(&sstable_data);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DBError::IO(_) => {} // Expected: IO error from checksum mismatch
+            other => panic!("Expected IO error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sstable_decode_corrupted_bloom_checksum() {
+        // Test that corrupted bloom filter checksum causes decode to fail
+        let memtable = SkipMap::new();
+        memtable.insert(b"key".to_vec(), (RecordType::Put, b"value".to_vec()));
+
+        // Use flush_memtable to create valid SSTable
+        let file_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let filename = format!("app-L0-{}.db", file_id);
+
+        flush_memtable(memtable, 0, file_id).unwrap();
+
+        // Read the file back
+        let mut sstable_data = std::fs::read(&filename).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
+
+        // Corrupt the bloom checksum in the footer (offset 48 in footer: 6 u64s = 48 bytes)
+        let footer_offset = sstable_data.len() - FOOTER_SIZE as usize;
+        let checksum_offset = footer_offset + 48;
+        sstable_data[checksum_offset] ^= 0xFF; // Flip bits
+
+        // Decode should fail with IO error (checksum validation happens in verify_bloom_checksum)
+        let result = SSTable::decode(&sstable_data);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DBError::IO(_) => {} // Expected: IO error from checksum mismatch
+            other => panic!("Expected IO error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sstable_decode_corrupted_footer_checksum() {
+        // Test that corrupted footer checksum causes decode to fail
+        let memtable = SkipMap::new();
+        memtable.insert(b"key".to_vec(), (RecordType::Put, b"value".to_vec()));
+
+        // Use flush_memtable to create valid SSTable
+        let file_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let filename = format!("app-L0-{}.db", file_id);
+
+        flush_memtable(memtable, 0, file_id).unwrap();
+
+        // Read the file back
+        let mut sstable_data = std::fs::read(&filename).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
+
+        // Corrupt the footer checksum (last 4 bytes of the file)
+        let len = sstable_data.len();
+        sstable_data[len - 1] ^= 0xFF;
+
+        // Decode should fail with IO error (checksum validation happens in SSTableFooter::decode)
+        let result = SSTable::decode(&sstable_data);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DBError::IO(_) => {} // Expected: IO error from checksum mismatch
+            other => panic!("Expected IO error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sstable_decode_invalid_magic_number() {
+        // Test that invalid magic number causes decode to fail
+        let memtable = SkipMap::new();
+        memtable.insert(b"key".to_vec(), (RecordType::Put, b"value".to_vec()));
+
+        // Use flush_memtable to create valid SSTable
+        let file_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let filename = format!("app-L0-{}.db", file_id);
+
+        flush_memtable(memtable, 0, file_id).unwrap();
+
+        // Read the file back
+        let mut sstable_data = std::fs::read(&filename).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
+
+        // Corrupt the magic number in footer (offset 52 in footer: 6 u64s + 2 u32s = 56 bytes, magic at 52)
+        let footer_offset = sstable_data.len() - FOOTER_SIZE as usize;
+        let magic_offset = footer_offset + 52;
+        sstable_data[magic_offset] ^= 0xFF; // Flip bits
+
+        // Decode should fail with IO error (magic number validation happens in SSTableFooter::decode)
+        let result = SSTable::decode(&sstable_data);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DBError::IO(_) => {} // Expected: IO error from invalid magic number
+            other => panic!("Expected IO error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sstable_decode_verifies_bloom_contains_keys() {
+        // Test that decoded bloom filter contains the expected keys
+        let memtable = SkipMap::new();
+        memtable.insert(b"alpha".to_vec(), (RecordType::Put, b"1".to_vec()));
+        memtable.insert(b"beta".to_vec(), (RecordType::Put, b"2".to_vec()));
+        memtable.insert(b"gamma".to_vec(), (RecordType::Put, b"3".to_vec()));
+
+        // Use flush_memtable to create SSTable
+        let file_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let filename = format!("app-L0-{}.db", file_id);
+
+        flush_memtable(memtable, 0, file_id).unwrap();
+
+        // Read the file back
+        let sstable_data = std::fs::read(&filename).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
+
+        // Decode and verify bloom filter
+        let decoded = SSTable::decode(&sstable_data).unwrap();
+
+        // Verify block metadata
+        assert_eq!(decoded.block.len(), 1, "Should have exactly one block");
+        let block = &decoded.block[0];
+        assert_eq!(
+            block.first_key, b"alpha",
+            "First key should be 'alpha' (sorted order)"
+        );
+        assert_eq!(
+            block.last_key, b"gamma",
+            "Last key should be 'gamma' (sorted order)"
+        );
+        assert_eq!(block.record_count, 3, "Block should contain 3 records");
+
+        // Verify index entry
+        assert_eq!(
+            decoded.index.len(),
+            1,
+            "Should have exactly one index entry"
+        );
+        let index_entry = &decoded.index[0];
+        assert_eq!(
+            index_entry.first_key, b"alpha",
+            "Index first_key should be 'alpha'"
+        );
+        assert_eq!(
+            index_entry.last_key, b"gamma",
+            "Index last_key should be 'gamma'"
+        );
+        assert_eq!(index_entry.record_count, 3, "Index should show 3 records");
+
+        // Verify bloom filter contains expected keys
+        assert!(
+            decoded.bloom.contains(b"alpha"),
+            "Bloom filter should contain 'alpha'"
+        );
+        assert!(
+            decoded.bloom.contains(b"beta"),
+            "Bloom filter should contain 'beta'"
+        );
+        assert!(
+            decoded.bloom.contains(b"gamma"),
+            "Bloom filter should contain 'gamma'"
+        );
+        assert!(
+            !decoded.bloom.contains(b"nonexistent"),
+            "Bloom filter should not contain 'nonexistent'"
         );
     }
 }

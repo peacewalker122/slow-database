@@ -17,6 +17,16 @@ pub struct BloomFilter {
     keys: Vec<Vec<u8>>,
 }
 
+impl std::fmt::Debug for BloomFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BloomFilter")
+            .field("bitmap_size", &self.bitmap_size)
+            .field("num_hashes", &self.num_hashes)
+            .field("keys_count", &self.keys.len())
+            .finish()
+    }
+}
+
 impl BloomFilter {
     /// Create a new Bloom filter
     ///

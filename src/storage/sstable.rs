@@ -14,15 +14,15 @@ use crate::{
 use super::{block::BlockBuilder, bloom::BloomFilter, record::RecordType};
 
 #[derive(Debug)]
-struct SSTable {
-    block: Vec<Block>,
+struct SSTable<'a> {
+    block: Vec<Block<'a>>,
     index: Vec<SparseIndexEntry>,
     bloom: BloomFilter,
     footer: SSTableFooter,
 }
 
-impl SSTable {
-    pub fn decode(data: &[u8]) -> Result<Self, DBError> {
+impl<'a> SSTable<'a> {
+    pub fn decode(data: &'a [u8]) -> Result<Self, DBError> {
         let mut cursor = std::io::Cursor::new(data);
 
         // Read footer
@@ -929,12 +929,10 @@ mod tests {
 
         let result = SSTableFooter::decode(Cursor::new(&encoded));
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Footer checksum mismatch")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Footer checksum mismatch"));
 
         // Test index checksum validation
         let mut index = BTreeMap::new();
@@ -968,12 +966,10 @@ mod tests {
 
         let result = read_sstable_index(Cursor::new(&index_block), &footer);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Index block checksum mismatch")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Index block checksum mismatch"));
     }
 
     #[test]
@@ -1353,6 +1349,287 @@ mod tests {
         assert!(
             !decoded.bloom.contains(b"nonexistent"),
             "Bloom filter should not contain 'nonexistent'"
+        );
+    }
+
+    #[test]
+    fn test_sstable_decode_block_data_single_record() {
+        // Positive test: Verifies that SSTable::decode populates block.data with exactly 1 record
+        // This tests the end-to-end integration: flush_memtable → SSTable::decode → Block::decode → block.data
+
+        // Arrange: Create memtable with 1 record
+        let memtable = SkipMap::new();
+        memtable.insert(
+            b"testkey".to_vec(),
+            (RecordType::Put, b"testvalue".to_vec()),
+        );
+
+        // Act: Flush and decode
+        let file_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let filename = format!("app-L0-{}.db", file_id);
+
+        flush_memtable(memtable, 0, file_id).unwrap();
+        let sstable_data = std::fs::read(&filename).unwrap();
+        std::fs::remove_file(&filename).unwrap();
+
+        let decoded = SSTable::decode(&sstable_data).unwrap();
+
+        // Assert: Verify block.data field is populated with 1 record
+        assert_eq!(decoded.block.len(), 1, "Should have exactly one block");
+        let block = &decoded.block[0];
+
+        assert!(
+            block.data.is_some(),
+            "block.data should be populated after decode"
+        );
+
+        let records = block.data.as_ref().unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "block.data should contain exactly 1 record"
+        );
+
+        // Verify the record's key, value, and type match expected
+        assert_eq!(records[0].key, b"testkey", "Record key should match");
+        assert_eq!(records[0].value, b"testvalue", "Record value should match");
+        assert_eq!(
+            records[0].record_type,
+            RecordType::Put,
+            "Record type should be Put"
+        );
+    }
+
+    #[test]
+    fn test_sstable_decode_block_data_multiple_records() {
+        // Positive test: Verifies that SSTable::decode populates block.data with all records in sorted order
+        // SkipMap automatically sorts keys, so we expect: bird, cat, dog, fish
+
+        // Arrange: Create memtable with 4 records (inserted out of order)
+        let memtable = SkipMap::new();
+        memtable.insert(b"dog".to_vec(), (RecordType::Put, b"woof".to_vec()));
+        memtable.insert(b"cat".to_vec(), (RecordType::Put, b"meow".to_vec()));
+        memtable.insert(b"bird".to_vec(), (RecordType::Put, b"tweet".to_vec()));
+        memtable.insert(b"fish".to_vec(), (RecordType::Put, b"blub".to_vec()));
+
+        // Act: Flush and decode
+        let file_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let filename = format!("app-L0-{}.db", file_id);
+
+        flush_memtable(memtable, 0, file_id).unwrap();
+        let sstable_data = std::fs::read(&filename).unwrap();
+        std::fs::remove_file(&filename).unwrap();
+
+        let decoded = SSTable::decode(&sstable_data).unwrap();
+
+        // Assert: Verify block.data contains all 4 records in sorted order
+        assert_eq!(decoded.block.len(), 1, "Should have exactly one block");
+        let block = &decoded.block[0];
+
+        assert!(
+            block.data.is_some(),
+            "block.data should be populated after decode"
+        );
+
+        let records = block.data.as_ref().unwrap();
+        assert_eq!(
+            records.len(),
+            4,
+            "block.data should contain exactly 4 records"
+        );
+
+        // Verify records are in sorted order (SkipMap sorts keys)
+        assert_eq!(records[0].key, b"bird", "First record should be 'bird'");
+        assert_eq!(
+            records[0].value, b"tweet",
+            "First record value should match"
+        );
+        assert_eq!(records[0].record_type, RecordType::Put);
+
+        assert_eq!(records[1].key, b"cat", "Second record should be 'cat'");
+        assert_eq!(
+            records[1].value, b"meow",
+            "Second record value should match"
+        );
+        assert_eq!(records[1].record_type, RecordType::Put);
+
+        assert_eq!(records[2].key, b"dog", "Third record should be 'dog'");
+        assert_eq!(records[2].value, b"woof", "Third record value should match");
+        assert_eq!(records[2].record_type, RecordType::Put);
+
+        assert_eq!(records[3].key, b"fish", "Fourth record should be 'fish'");
+        assert_eq!(
+            records[3].value, b"blub",
+            "Fourth record value should match"
+        );
+        assert_eq!(records[3].record_type, RecordType::Put);
+    }
+
+    #[test]
+    fn test_sstable_decode_block_data_preserves_tombstones() {
+        // Positive test: Verifies that SSTable::decode preserves RecordType::Delete (tombstones) in block.data
+        // This ensures the decoding correctly maintains record type information
+
+        // Arrange: Create memtable with mixed Put and Delete records
+        let memtable = SkipMap::new();
+        memtable.insert(b"active".to_vec(), (RecordType::Put, b"alive".to_vec()));
+        memtable.insert(b"deleted".to_vec(), (RecordType::Delete, b"".to_vec()));
+        memtable.insert(
+            b"updated".to_vec(),
+            (RecordType::Put, b"new_value".to_vec()),
+        );
+
+        // Act: Flush and decode
+        let file_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let filename = format!("app-L0-{}.db", file_id);
+
+        flush_memtable(memtable, 0, file_id).unwrap();
+        let sstable_data = std::fs::read(&filename).unwrap();
+        std::fs::remove_file(&filename).unwrap();
+
+        let decoded = SSTable::decode(&sstable_data).unwrap();
+
+        // Assert: Verify block.data contains all 3 records with correct types
+        assert_eq!(decoded.block.len(), 1, "Should have exactly one block");
+        let block = &decoded.block[0];
+
+        assert!(
+            block.data.is_some(),
+            "block.data should be populated after decode"
+        );
+
+        let records = block.data.as_ref().unwrap();
+        assert_eq!(
+            records.len(),
+            3,
+            "block.data should contain exactly 3 records"
+        );
+
+        // SkipMap sorts keys: active, deleted, updated
+        assert_eq!(records[0].key, b"active", "First record should be 'active'");
+        assert_eq!(records[0].value, b"alive");
+        assert_eq!(
+            records[0].record_type,
+            RecordType::Put,
+            "First record should be Put"
+        );
+
+        assert_eq!(
+            records[1].key, b"deleted",
+            "Second record should be 'deleted'"
+        );
+        assert_eq!(
+            records[1].value, b"",
+            "Delete record should have empty value"
+        );
+        assert_eq!(
+            records[1].record_type,
+            RecordType::Delete,
+            "Second record should be Delete (tombstone)"
+        );
+
+        assert_eq!(
+            records[2].key, b"updated",
+            "Third record should be 'updated'"
+        );
+        assert_eq!(records[2].value, b"new_value");
+        assert_eq!(
+            records[2].record_type,
+            RecordType::Put,
+            "Third record should be Put"
+        );
+    }
+
+    #[test]
+    fn test_sstable_decode_block_data_multiple_blocks() {
+        // Positive test: Verifies that SSTable::decode populates block.data for ALL blocks
+        // when the SSTable spans multiple 4KB blocks. This ensures the decoding loop
+        // in SSTable::decode properly handles each block independently.
+
+        // Arrange: Create memtable with 50 small records
+        // This should create at least 1 block, and we verify block.data is populated for all blocks
+        let memtable = SkipMap::new();
+        for i in 0..50 {
+            let key = format!("testkey{:03}", i);
+            let value = format!("testvalue{:03}", i);
+            memtable.insert(
+                key.as_bytes().to_vec(),
+                (RecordType::Put, value.as_bytes().to_vec()),
+            );
+        }
+
+        // Act: Flush and decode
+        let file_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let filename = format!("app-L0-{}.db", file_id);
+
+        flush_memtable(memtable, 0, file_id).unwrap();
+        let sstable_data = std::fs::read(&filename).unwrap();
+        std::fs::remove_file(&filename).unwrap();
+
+        let decoded = SSTable::decode(&sstable_data).unwrap();
+
+        // Assert: Verify block.data is populated for ALL blocks (whether 1 or more)
+        assert!(decoded.block.len() >= 1, "Should have at least 1 block");
+
+        // Verify each block has block.data populated
+        let mut total_records = 0;
+        for (i, block) in decoded.block.iter().enumerate() {
+            assert!(
+                block.data.is_some(),
+                "Block {} should have data populated",
+                i
+            );
+
+            let records = block.data.as_ref().unwrap();
+            assert_eq!(
+                records.len() as u32,
+                block.record_count,
+                "Block {} data length should match record_count",
+                i
+            );
+
+            // Verify each record in this block is valid
+            for (j, record) in records.iter().enumerate() {
+                assert!(
+                    !record.key.is_empty(),
+                    "Block {} record {} should have non-empty key",
+                    i,
+                    j
+                );
+                assert!(
+                    !record.value.is_empty(),
+                    "Block {} record {} should have non-empty value",
+                    i,
+                    j
+                );
+                assert_eq!(
+                    record.record_type,
+                    RecordType::Put,
+                    "Block {} record {} should be Put type",
+                    i,
+                    j
+                );
+            }
+
+            total_records += records.len();
+        }
+
+        // Verify we decoded all 50 records across all blocks
+        assert_eq!(
+            total_records, 50,
+            "Should have decoded all 50 records across all blocks"
         );
     }
 }

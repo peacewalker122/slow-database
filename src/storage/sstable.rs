@@ -1,5 +1,6 @@
 use std::{
-    collections::BTreeMap,
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap},
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
 };
@@ -348,29 +349,34 @@ fn verify_bloom_checksum(data: &[u8], expected: u32) -> Result<(), std::io::Erro
 ///
 /// # Arguments
 /// * `memtable` - The memtable to flush
-/// * `level` - The LSM-tree level (0 for memtable flushes, 1+ for compaction)
-/// * `file_id` - Unique identifier for this SSTable file (typically timestamp)
+/// * `filename` - The filename to write the SSTable to
+/// * `_level` - The LSM-tree level (0 for memtable flushes, 1+ for compaction)
+/// * `_file_id` - Unique identifier for this SSTable file (typically timestamp)
 ///
 /// # File Naming Convention
 /// Files are named as: `app-L{level}-{file_id}.db`
 /// Example: `app-L0-1735948800.db` for a Level 0 SSTable with timestamp ID
-pub fn flush_memtable(
-    memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)>,
-    level: u32,
-    file_id: u64,
-) -> Result<(), std::io::Error> {
-    let filename = format!("app-L{}-{}.db", level, file_id);
 
+static DBFILENAME: &str = "app.db";
+pub fn flush_memtable(
+    memtable: &SkipMap<Vec<u8>, (RecordType, Vec<u8>)>,
+    filename: &str,
+    _level: u32,
+    _file_id: u64,
+) -> Result<(), std::io::Error> {
     log::info!(
         "Starting memtable flush to SSTable '{}' with 4KB blocks, entries: {}",
         filename,
         memtable.len()
     );
 
+    // read file or create if not exists
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&filename)?;
+        .open(filename)?;
+
+    // TODO: do the merge in here first for the memtable & data from existing sstables
 
     let data_block_start = file.metadata()?.len();
 
@@ -397,8 +403,18 @@ pub fn flush_memtable(
 
         // Encode the record with sequential LSN
         let record = match val.0 {
-            RecordType::Delete => Record::new(key, &val.1, RecordType::Delete),
-            RecordType::Put => Record::new(key, &val.1, RecordType::Put),
+            RecordType::Delete => Record::new(
+                key,
+                &val.1,
+                RecordType::Delete,
+                crate::storage::record::current_timestamp_millis(),
+            ),
+            RecordType::Put => Record::new(
+                key,
+                &val.1,
+                RecordType::Put,
+                crate::storage::record::current_timestamp_millis(),
+            ),
         };
 
         // Try to add record to current block
@@ -519,7 +535,7 @@ pub fn flush_memtable(
 
     log::info!(
         "Flushed SSTable '{}': {} blocks, data=[{}-{}], sparse_index=[{}-{}], bloom=[{}-{}], index_crc=0x{:X}, bloom_crc=0x{:X}",
-        filename,
+        DBFILENAME,
         blocks.len(),
         data_block_start,
         data_block_end,
@@ -532,6 +548,129 @@ pub fn flush_memtable(
     );
 
     Ok(())
+}
+
+pub fn merge_sstables<'a>(
+    memtable: &SkipMap<&'a [u8], (RecordType, &'a [u8])>,
+    sstables: Vec<Block<'a>>,
+) -> Result<Vec<Record<'a>>, DBError> {
+    let mut minheap = BinaryHeap::with_capacity(memtable.len() + sstables.len());
+
+    // how to solve duplicate keys here?
+    // if we pop the same key that already inserted and that value were having lower timestamp we
+    // need to remove the old and insert the newest one.
+    //
+    // the math is like this:
+    // - for popping the same key it cost us with O(log n) where n is the number of elements in the heap
+    // - for checking if the key exists in the heap it cost us O(n) since BinaryHeap doesn't support efficient search
+    // - for removing an element from the heap it cost us O(n) as well since we need to find it first
+    //
+    // so the math conclude that the operation weren't scallable enough for large number of keys.
+    //
+    // we need to map first, so we can have O(1) and solve the "conflict" easily. The map will store the key and the latest record.
+    // This operation took O(2m) where m is the number of entries in memtable + sstables, where
+    // each m is O(n) for operation to mapping it to the map.
+    // And m is O(n) for sorting it
+
+    // sstable
+    let mut seen_keys: BTreeMap<&'a [u8], Record<'a>> = BTreeMap::new();
+
+    // sstable
+    for sstable in sstables.iter() {
+        if let Some(val) = &sstable.data {
+            for (_, record) in val.iter() {
+                let existing = seen_keys.get(record.key);
+                match existing {
+                    Some(existing_record) => {
+                        // If existing record has older timestamp, replace it
+                        if record.timestamp > existing_record.timestamp {
+                            seen_keys.insert(record.key, record.clone());
+                        }
+                    }
+                    None => {
+                        // Key not seen before, insert it
+                        seen_keys.insert(record.key, record.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // memtable
+    memtable
+        .iter()
+        .map(|entry| {
+            let (record_type, value) = entry.value();
+
+            Record::new(
+                entry.key(),
+                value,
+                *record_type,
+                crate::storage::record::current_timestamp_millis(),
+            )
+        })
+        .for_each(|record| {
+            let existing = seen_keys.get(record.key);
+            match existing {
+                Some(existing_record) => {
+                    // If existing record has older timestamp, replace it
+                    if record.timestamp > existing_record.timestamp {
+                        seen_keys.insert(record.key, record);
+                    }
+                }
+                None => {
+                    // Key not seen before, insert it
+                    seen_keys.insert(record.key, record);
+                }
+            }
+        });
+
+    // Now push all unique records into the min-heap for sorting
+    for record in seen_keys.values() {
+        minheap.push(Reverse(record));
+    }
+
+    // Extract records from min-heap in sorted order
+    let mut merged_records = Vec::with_capacity(minheap.len());
+    while let Some(Reverse(record)) = minheap.pop() {
+        // check if current key having duplicate key on the next record,
+        // if so we need to compare the timestamp and only keep the latest one
+
+        println!(
+            "Merging record key: {:?}, timestamp: {}",
+            String::from_utf8_lossy(&record.key),
+            record.timestamp
+        );
+
+        let val = minheap.peek();
+
+        println!(
+            "Next record in heap: {:?}",
+            val.as_ref().map(|r| String::from_utf8_lossy(&r.0.key))
+        );
+
+        if let Some(Reverse(next_record)) = val {
+            if record.key == next_record.key {
+                // same key found, compare timestamp
+                if record.timestamp >= next_record.timestamp {
+                    // current record is latest, keep it and skip the next one
+                    merged_records.push(record.clone());
+                    minheap.pop(); // remove the next record
+                } else {
+                    // next record is latest, skip current one
+                    continue;
+                }
+            } else {
+                // no duplicate key, just add current record
+                merged_records.push(record.clone());
+            }
+        } else {
+            // no next record, just add current record
+            merged_records.push(record.clone());
+        }
+    }
+
+    Ok(merged_records)
 }
 
 /// Read the footer from an SSTable file
@@ -929,10 +1068,12 @@ mod tests {
 
         let result = SSTableFooter::decode(Cursor::new(&encoded));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Footer checksum mismatch"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Footer checksum mismatch")
+        );
 
         // Test index checksum validation
         let mut index = BTreeMap::new();
@@ -966,10 +1107,12 @@ mod tests {
 
         let result = read_sstable_index(Cursor::new(&index_block), &footer);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Index block checksum mismatch"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Index block checksum mismatch")
+        );
     }
 
     #[test]
@@ -981,14 +1124,14 @@ mod tests {
         memtable.insert(b"banana".to_vec(), (RecordType::Put, b"yellow".to_vec()));
         memtable.insert(b"cherry".to_vec(), (RecordType::Put, b"red".to_vec()));
 
-        // Use flush_memtable to create SSTable
+        // Use flush_memtable to create SSTable with unique filename
         let file_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let filename = format!("app-L0-{}.db", file_id);
+        let filename = format!("test_sstable_decode_valid_{}.db", file_id);
 
-        flush_memtable(memtable, 0, file_id).unwrap();
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
         // Read the file back
         let sstable_data = std::fs::read(&filename).unwrap();
@@ -1048,14 +1191,14 @@ mod tests {
         let memtable = SkipMap::new();
         memtable.insert(b"key".to_vec(), (RecordType::Put, b"value".to_vec()));
 
-        // Use flush_memtable to create SSTable
+        // Use flush_memtable to create SSTable with unique filename
         let file_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let filename = format!("app-L0-{}.db", file_id);
+        let filename = format!("test_sstable_decode_single_block_{}.db", file_id);
 
-        flush_memtable(memtable, 0, file_id).unwrap();
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
         // Read the file back
         let sstable_data = std::fs::read(&filename).unwrap();
@@ -1110,14 +1253,14 @@ mod tests {
         let memtable = SkipMap::new();
         // Don't insert anything - empty memtable
 
-        // Use flush_memtable to create SSTable
+        // Use flush_memtable to create SSTable with unique filename
         let file_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let filename = format!("app-L0-{}.db", file_id);
+        let filename = format!("test_sstable_decode_empty_sstable_{}.db", file_id);
 
-        flush_memtable(memtable, 0, file_id).unwrap();
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
         // Read the file back
         let sstable_data = std::fs::read(&filename).unwrap();
@@ -1139,14 +1282,17 @@ mod tests {
         let memtable = SkipMap::new();
         memtable.insert(b"key".to_vec(), (RecordType::Put, b"value".to_vec()));
 
-        // Use flush_memtable to create valid SSTable
+        // Use flush_memtable to create valid SSTable with unique filename
         let file_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let filename = format!("app-L0-{}.db", file_id);
+        let filename = format!(
+            "test_sstable_decode_corrupted_index_checksum_{}.db",
+            file_id
+        );
 
-        flush_memtable(memtable, 0, file_id).unwrap();
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
         // Read the file back
         let mut sstable_data = std::fs::read(&filename).unwrap();
@@ -1179,14 +1325,17 @@ mod tests {
         let memtable = SkipMap::new();
         memtable.insert(b"key".to_vec(), (RecordType::Put, b"value".to_vec()));
 
-        // Use flush_memtable to create valid SSTable
+        // Use flush_memtable to create valid SSTable with unique filename
         let file_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let filename = format!("app-L0-{}.db", file_id);
+        let filename = format!(
+            "test_sstable_decode_corrupted_bloom_checksum_{}.db",
+            file_id
+        );
 
-        flush_memtable(memtable, 0, file_id).unwrap();
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
         // Read the file back
         let mut sstable_data = std::fs::read(&filename).unwrap();
@@ -1214,14 +1363,17 @@ mod tests {
         let memtable = SkipMap::new();
         memtable.insert(b"key".to_vec(), (RecordType::Put, b"value".to_vec()));
 
-        // Use flush_memtable to create valid SSTable
+        // Use flush_memtable to create valid SSTable with unique filename
         let file_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let filename = format!("app-L0-{}.db", file_id);
+        let filename = format!(
+            "test_sstable_decode_corrupted_footer_checksum_{}.db",
+            file_id
+        );
 
-        flush_memtable(memtable, 0, file_id).unwrap();
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
         // Read the file back
         let mut sstable_data = std::fs::read(&filename).unwrap();
@@ -1248,14 +1400,14 @@ mod tests {
         let memtable = SkipMap::new();
         memtable.insert(b"key".to_vec(), (RecordType::Put, b"value".to_vec()));
 
-        // Use flush_memtable to create valid SSTable
+        // Use flush_memtable to create valid SSTable with unique filename
         let file_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let filename = format!("app-L0-{}.db", file_id);
+        let filename = format!("test_sstable_decode_invalid_magic_number_{}.db", file_id);
 
-        flush_memtable(memtable, 0, file_id).unwrap();
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
         // Read the file back
         let mut sstable_data = std::fs::read(&filename).unwrap();
@@ -1285,14 +1437,17 @@ mod tests {
         memtable.insert(b"beta".to_vec(), (RecordType::Put, b"2".to_vec()));
         memtable.insert(b"gamma".to_vec(), (RecordType::Put, b"3".to_vec()));
 
-        // Use flush_memtable to create SSTable
+        // Use flush_memtable to create SSTable with unique filename
         let file_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let filename = format!("app-L0-{}.db", file_id);
+        let filename = format!(
+            "test_sstable_decode_verifies_bloom_contains_keys_{}.db",
+            file_id
+        );
 
-        flush_memtable(memtable, 0, file_id).unwrap();
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
         // Read the file back
         let sstable_data = std::fs::read(&filename).unwrap();
@@ -1364,14 +1519,17 @@ mod tests {
             (RecordType::Put, b"testvalue".to_vec()),
         );
 
-        // Act: Flush and decode
+        // Act: Flush and decode with unique filename
         let file_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let filename = format!("app-L0-{}.db", file_id);
+        let filename = format!(
+            "test_sstable_decode_block_data_single_record_{}.db",
+            file_id
+        );
 
-        flush_memtable(memtable, 0, file_id).unwrap();
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
         let sstable_data = std::fs::read(&filename).unwrap();
         std::fs::remove_file(&filename).unwrap();
 
@@ -1394,10 +1552,13 @@ mod tests {
         );
 
         // Verify the record's key, value, and type match expected
-        assert_eq!(records[0].key, b"testkey", "Record key should match");
-        assert_eq!(records[0].value, b"testvalue", "Record value should match");
+        let record = records
+            .get(b"testkey" as &[u8])
+            .expect("Key 'testkey' should exist");
+        assert_eq!(record.key, b"testkey", "Record key should match");
+        assert_eq!(record.value, b"testvalue", "Record value should match");
         assert_eq!(
-            records[0].record_type,
+            record.record_type,
             RecordType::Put,
             "Record type should be Put"
         );
@@ -1415,14 +1576,17 @@ mod tests {
         memtable.insert(b"bird".to_vec(), (RecordType::Put, b"tweet".to_vec()));
         memtable.insert(b"fish".to_vec(), (RecordType::Put, b"blub".to_vec()));
 
-        // Act: Flush and decode
+        // Act: Flush and decode with unique filename
         let file_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let filename = format!("app-L0-{}.db", file_id);
+        let filename = format!(
+            "test_sstable_decode_block_data_multiple_records_{}.db",
+            file_id
+        );
 
-        flush_memtable(memtable, 0, file_id).unwrap();
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
         let sstable_data = std::fs::read(&filename).unwrap();
         std::fs::remove_file(&filename).unwrap();
 
@@ -1445,30 +1609,43 @@ mod tests {
         );
 
         // Verify records are in sorted order (SkipMap sorts keys)
-        assert_eq!(records[0].key, b"bird", "First record should be 'bird'");
+        // Access each record by key using BTreeMap.get()
+        let record_bird = records
+            .get(b"bird" as &[u8])
+            .expect("Key 'bird' should exist");
+        assert_eq!(record_bird.key, b"bird", "First record should be 'bird'");
         assert_eq!(
-            records[0].value, b"tweet",
+            record_bird.value, b"tweet",
             "First record value should match"
         );
-        assert_eq!(records[0].record_type, RecordType::Put);
+        assert_eq!(record_bird.record_type, RecordType::Put);
 
-        assert_eq!(records[1].key, b"cat", "Second record should be 'cat'");
+        let record_cat = records
+            .get(b"cat" as &[u8])
+            .expect("Key 'cat' should exist");
+        assert_eq!(record_cat.key, b"cat", "Second record should be 'cat'");
         assert_eq!(
-            records[1].value, b"meow",
+            record_cat.value, b"meow",
             "Second record value should match"
         );
-        assert_eq!(records[1].record_type, RecordType::Put);
+        assert_eq!(record_cat.record_type, RecordType::Put);
 
-        assert_eq!(records[2].key, b"dog", "Third record should be 'dog'");
-        assert_eq!(records[2].value, b"woof", "Third record value should match");
-        assert_eq!(records[2].record_type, RecordType::Put);
+        let record_dog = records
+            .get(b"dog" as &[u8])
+            .expect("Key 'dog' should exist");
+        assert_eq!(record_dog.key, b"dog", "Third record should be 'dog'");
+        assert_eq!(record_dog.value, b"woof", "Third record value should match");
+        assert_eq!(record_dog.record_type, RecordType::Put);
 
-        assert_eq!(records[3].key, b"fish", "Fourth record should be 'fish'");
+        let record_fish = records
+            .get(b"fish" as &[u8])
+            .expect("Key 'fish' should exist");
+        assert_eq!(record_fish.key, b"fish", "Fourth record should be 'fish'");
         assert_eq!(
-            records[3].value, b"blub",
+            record_fish.value, b"blub",
             "Fourth record value should match"
         );
-        assert_eq!(records[3].record_type, RecordType::Put);
+        assert_eq!(record_fish.record_type, RecordType::Put);
     }
 
     #[test]
@@ -1485,14 +1662,17 @@ mod tests {
             (RecordType::Put, b"new_value".to_vec()),
         );
 
-        // Act: Flush and decode
+        // Act: Flush and decode with unique filename
         let file_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let filename = format!("app-L0-{}.db", file_id);
+        let filename = format!(
+            "test_sstable_decode_block_data_preserves_tombstones_{}.db",
+            file_id
+        );
 
-        flush_memtable(memtable, 0, file_id).unwrap();
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
         let sstable_data = std::fs::read(&filename).unwrap();
         std::fs::remove_file(&filename).unwrap();
 
@@ -1515,35 +1695,48 @@ mod tests {
         );
 
         // SkipMap sorts keys: active, deleted, updated
-        assert_eq!(records[0].key, b"active", "First record should be 'active'");
-        assert_eq!(records[0].value, b"alive");
+        // Access each record by key using BTreeMap.get()
+        let record_active = records
+            .get(b"active" as &[u8])
+            .expect("Key 'active' should exist");
         assert_eq!(
-            records[0].record_type,
+            record_active.key, b"active",
+            "First record should be 'active'"
+        );
+        assert_eq!(record_active.value, b"alive");
+        assert_eq!(
+            record_active.record_type,
             RecordType::Put,
             "First record should be Put"
         );
 
+        let record_deleted = records
+            .get(b"deleted" as &[u8])
+            .expect("Key 'deleted' should exist");
         assert_eq!(
-            records[1].key, b"deleted",
+            record_deleted.key, b"deleted",
             "Second record should be 'deleted'"
         );
         assert_eq!(
-            records[1].value, b"",
+            record_deleted.value, b"",
             "Delete record should have empty value"
         );
         assert_eq!(
-            records[1].record_type,
+            record_deleted.record_type,
             RecordType::Delete,
             "Second record should be Delete (tombstone)"
         );
 
+        let record_updated = records
+            .get(b"updated" as &[u8])
+            .expect("Key 'updated' should exist");
         assert_eq!(
-            records[2].key, b"updated",
+            record_updated.key, b"updated",
             "Third record should be 'updated'"
         );
-        assert_eq!(records[2].value, b"new_value");
+        assert_eq!(record_updated.value, b"new_value");
         assert_eq!(
-            records[2].record_type,
+            record_updated.record_type,
             RecordType::Put,
             "Third record should be Put"
         );
@@ -1567,14 +1760,17 @@ mod tests {
             );
         }
 
-        // Act: Flush and decode
+        // Act: Flush and decode with unique filename
         let file_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
-        let filename = format!("app-L0-{}.db", file_id);
+        let filename = format!(
+            "test_sstable_decode_block_data_multiple_blocks_{}.db",
+            file_id
+        );
 
-        flush_memtable(memtable, 0, file_id).unwrap();
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
         let sstable_data = std::fs::read(&filename).unwrap();
         std::fs::remove_file(&filename).unwrap();
 
@@ -1601,25 +1797,22 @@ mod tests {
             );
 
             // Verify each record in this block is valid
-            for (j, record) in records.iter().enumerate() {
+            for (_key, record) in records.iter() {
                 assert!(
                     !record.key.is_empty(),
-                    "Block {} record {} should have non-empty key",
-                    i,
-                    j
+                    "Block {} record should have non-empty key",
+                    i
                 );
                 assert!(
                     !record.value.is_empty(),
-                    "Block {} record {} should have non-empty value",
-                    i,
-                    j
+                    "Block {} record should have non-empty value",
+                    i
                 );
                 assert_eq!(
                     record.record_type,
                     RecordType::Put,
-                    "Block {} record {} should be Put type",
-                    i,
-                    j
+                    "Block {} record should be Put type",
+                    i
                 );
             }
 
@@ -1631,5 +1824,410 @@ mod tests {
             total_records, 50,
             "Should have decoded all 50 records across all blocks"
         );
+    }
+
+    // ============================================================================
+    // merge_sstables Tests
+    // ============================================================================
+
+    #[test]
+    fn test_merge_sstables_empty() {
+        // Test merging empty memtable with empty SSTables
+        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+        let sstables: Vec<Block> = vec![];
+
+        let result = merge_sstables(&memtable, sstables).unwrap();
+
+        assert_eq!(
+            result.len(),
+            0,
+            "Merging empty inputs should return empty result"
+        );
+    }
+
+    #[test]
+    fn test_merge_sstables_memtable_only() {
+        // Test merging memtable with no SSTables - should return sorted memtable records
+        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+        memtable.insert(b"dog", (RecordType::Put, b"woof"));
+        memtable.insert(b"cat", (RecordType::Put, b"meow"));
+        memtable.insert(b"bird", (RecordType::Put, b"tweet"));
+
+        let sstables: Vec<Block> = vec![];
+
+        let result = merge_sstables(&memtable, sstables).unwrap();
+
+        assert_eq!(result.len(), 3, "Should have 3 records from memtable");
+
+        // Verify sorted order (bird, cat, dog)
+        assert_eq!(result[0].key, b"bird", "First record should be 'bird'");
+        assert_eq!(result[0].value, b"tweet");
+        assert_eq!(result[0].record_type, RecordType::Put);
+
+        assert_eq!(result[1].key, b"cat", "Second record should be 'cat'");
+        assert_eq!(result[1].value, b"meow");
+
+        assert_eq!(result[2].key, b"dog", "Third record should be 'dog'");
+        assert_eq!(result[2].value, b"woof");
+    }
+
+    #[test]
+    fn test_merge_sstables_sstable_only() {
+        // Test merging empty memtable with SSTable data - should return sorted SSTable records
+        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+
+        // Create a block with data
+        let mut block_data = BTreeMap::new();
+        block_data.insert(
+            b"apple" as &[u8],
+            Record::new(b"apple", b"red", RecordType::Put, 1000),
+        );
+        block_data.insert(
+            b"banana" as &[u8],
+            Record::new(b"banana", b"yellow", RecordType::Put, 1000),
+        );
+
+        let block = Block {
+            offset: 0,
+            first_key: b"apple".to_vec(),
+            last_key: b"banana".to_vec(),
+            record_count: 2,
+            data_size: 100,
+            data: Some(block_data),
+        };
+
+        let sstables = vec![block];
+
+        let result = merge_sstables(&memtable, sstables).unwrap();
+
+        assert_eq!(result.len(), 2, "Should have 2 records from SSTable");
+
+        // Verify sorted order (apple, banana)
+        assert_eq!(result[0].key, b"apple", "First record should be 'apple'");
+        assert_eq!(result[0].value, b"red");
+        assert_eq!(result[0].record_type, RecordType::Put);
+
+        assert_eq!(result[1].key, b"banana", "Second record should be 'banana'");
+        assert_eq!(result[1].value, b"yellow");
+    }
+
+    #[test]
+    fn test_merge_sstables_memtable_and_sstable() {
+        // Test merging memtable and SSTable with non-overlapping keys
+        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+        memtable.insert(b"dog", (RecordType::Put, b"woof"));
+        memtable.insert(b"cat", (RecordType::Put, b"meow"));
+
+        // Create SSTable block
+        let mut block_data = BTreeMap::new();
+        block_data.insert(
+            b"apple" as &[u8],
+            Record::new(b"apple", b"red", RecordType::Put, 1000),
+        );
+        block_data.insert(
+            b"banana" as &[u8],
+            Record::new(b"banana", b"yellow", RecordType::Put, 1000),
+        );
+
+        let block = Block {
+            offset: 0,
+            first_key: b"apple".to_vec(),
+            last_key: b"banana".to_vec(),
+            record_count: 2,
+            data_size: 100,
+            data: Some(block_data),
+        };
+
+        let sstables = vec![block];
+
+        let result = merge_sstables(&memtable, sstables).unwrap();
+
+        assert_eq!(result.len(), 4, "Should have 4 merged records");
+
+        // Verify sorted order: apple, banana, cat, dog
+        assert_eq!(result[0].key, b"apple");
+        assert_eq!(result[1].key, b"banana");
+        assert_eq!(result[2].key, b"cat");
+        assert_eq!(result[3].key, b"dog");
+    }
+
+    #[test]
+    fn test_merge_sstables_duplicate_keys_memtable_wins() {
+        // Test merging records with duplicate keys from memtable and SSTable
+        // Current implementation returns all records sorted (no deduplication yet)
+        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+        memtable.insert(b"key1", (RecordType::Put, b"new_value"));
+
+        // Create SSTable block with same key
+        let mut block_data = BTreeMap::new();
+        block_data.insert(
+            b"key1" as &[u8],
+            Record::new(b"key1", b"old_value", RecordType::Put, 1000),
+        );
+
+        let block = Block {
+            offset: 0,
+            first_key: b"key1".to_vec(),
+            last_key: b"key1".to_vec(),
+            record_count: 1,
+            data_size: 50,
+            data: Some(block_data),
+        };
+
+        let sstables = vec![block];
+
+        let result = merge_sstables(&memtable, sstables).unwrap();
+
+        // Current implementation returns both records sorted by key, then by timestamp (desc)
+        assert_eq!(result.len(), 1, "Should have 1 records");
+
+        // Both records should have key "key1", sorted by timestamp (newer first)
+        assert_eq!(result[0].key, b"key1");
+
+        assert_eq!(
+            result[0].value, b"new_value",
+            "First should be memtable record"
+        );
+
+        assert!(
+            result[0].timestamp != 0,
+            "First should have memtable timestamp (0)"
+        );
+    }
+
+    #[test]
+    fn test_merge_sstables_duplicate_keys_sstable_wins() {
+        // Test merging records with duplicate keys from multiple SSTables
+        // Current implementation returns all records sorted (no deduplication yet)
+        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+
+        // Create two SSTable blocks with same key but different timestamps
+        let mut block_data1 = BTreeMap::new();
+        block_data1.insert(
+            b"key1" as &[u8],
+            Record::new(b"key1", b"old_value", RecordType::Put, 1000), // older
+        );
+
+        let block1 = Block {
+            offset: 0,
+            first_key: b"key1".to_vec(),
+            last_key: b"key1".to_vec(),
+            record_count: 1,
+            data_size: 50,
+            data: Some(block_data1),
+        };
+
+        let mut block_data2 = BTreeMap::new();
+        block_data2.insert(
+            b"key1" as &[u8],
+            Record::new(b"key1", b"new_value", RecordType::Put, 2000), // newer
+        );
+
+        let block2 = Block {
+            offset: 100,
+            first_key: b"key1".to_vec(),
+            last_key: b"key1".to_vec(),
+            record_count: 1,
+            data_size: 50,
+            data: Some(block_data2),
+        };
+
+        let sstables = vec![block1, block2];
+
+        let result = merge_sstables(&memtable, sstables).unwrap();
+
+        // Current implementation returns both records sorted by key, then by timestamp (desc)
+        assert_eq!(
+            result.len(),
+            1,
+            "Should have 1 records (no deduplication yet)"
+        );
+
+        // Both records should have key "key1", sorted by timestamp (newer first)
+        assert_eq!(result[0].key, b"key1");
+
+        // Verify newer record comes first due to Record::Ord impl (descending timestamp)
+        assert_eq!(
+            result[0].timestamp, 2000,
+            "First should have newer timestamp"
+        );
+        assert_eq!(
+            result[0].value, b"new_value",
+            "First should be newer record"
+        );
+    }
+
+    #[test]
+    fn test_merge_sstables_multiple_sstables() {
+        // Test merging multiple SSTables with non-overlapping keys
+        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+        memtable.insert(b"zebra", (RecordType::Put, b"stripes"));
+
+        // SSTable 1
+        let mut block_data1 = BTreeMap::new();
+        block_data1.insert(
+            b"apple" as &[u8],
+            Record::new(b"apple", b"red", RecordType::Put, 1000),
+        );
+
+        let block1 = Block {
+            offset: 0,
+            first_key: b"apple".to_vec(),
+            last_key: b"apple".to_vec(),
+            record_count: 1,
+            data_size: 50,
+            data: Some(block_data1),
+        };
+
+        // SSTable 2
+        let mut block_data2 = BTreeMap::new();
+        block_data2.insert(
+            b"mango" as &[u8],
+            Record::new(b"mango", b"orange", RecordType::Put, 1000),
+        );
+
+        let block2 = Block {
+            offset: 100,
+            first_key: b"mango".to_vec(),
+            last_key: b"mango".to_vec(),
+            record_count: 1,
+            data_size: 50,
+            data: Some(block_data2),
+        };
+
+        let sstables = vec![block1, block2];
+
+        let result = merge_sstables(&memtable, sstables).unwrap();
+
+        assert_eq!(result.len(), 3, "Should have 3 records from all sources");
+
+        // Verify sorted order: apple, mango, zebra
+        assert_eq!(result[0].key, b"apple");
+        assert_eq!(result[1].key, b"mango");
+        assert_eq!(result[2].key, b"zebra");
+    }
+
+    #[test]
+    fn test_merge_sstables_preserves_record_types() {
+        // Test that both Put and Delete record types are preserved
+        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+        memtable.insert(b"deleted_key", (RecordType::Delete, b""));
+        memtable.insert(b"active_key", (RecordType::Put, b"value"));
+
+        // Create SSTable block with mixed types
+        let mut block_data = BTreeMap::new();
+        block_data.insert(
+            b"another_deleted" as &[u8],
+            Record::new(b"another_deleted", b"", RecordType::Delete, 1000),
+        );
+        block_data.insert(
+            b"another_active" as &[u8],
+            Record::new(b"another_active", b"data", RecordType::Put, 1000),
+        );
+
+        let block = Block {
+            offset: 0,
+            first_key: b"another_active".to_vec(),
+            last_key: b"another_deleted".to_vec(),
+            record_count: 2,
+            data_size: 100,
+            data: Some(block_data),
+        };
+
+        let sstables = vec![block];
+
+        let result = merge_sstables(&memtable, sstables).unwrap();
+
+        assert_eq!(result.len(), 4, "Should have 4 records");
+
+        // Verify record types are preserved
+        // Sorted order: active_key, another_active, another_deleted, deleted_key
+        assert_eq!(result[0].key, b"active_key");
+        assert_eq!(result[0].record_type, RecordType::Put);
+
+        assert_eq!(result[1].key, b"another_active");
+        assert_eq!(result[1].record_type, RecordType::Put);
+
+        assert_eq!(result[2].key, b"another_deleted");
+        assert_eq!(result[2].record_type, RecordType::Delete);
+
+        assert_eq!(result[3].key, b"deleted_key");
+        assert_eq!(result[3].record_type, RecordType::Delete);
+    }
+
+    #[test]
+    fn test_merge_sstables_sorted_output() {
+        // Test that output is correctly sorted by key regardless of input order
+        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+        // Insert in random order
+        memtable.insert(b"z_last", (RecordType::Put, b"zzz"));
+        memtable.insert(b"a_first", (RecordType::Put, b"aaa"));
+        memtable.insert(b"m_middle", (RecordType::Put, b"mmm"));
+
+        // Create SSTable block with random order keys
+        let mut block_data = BTreeMap::new();
+        block_data.insert(
+            b"d_four" as &[u8],
+            Record::new(b"d_four", b"ddd", RecordType::Put, 1000),
+        );
+        block_data.insert(
+            b"b_two" as &[u8],
+            Record::new(b"b_two", b"bbb", RecordType::Put, 1000),
+        );
+
+        let block = Block {
+            offset: 0,
+            first_key: b"b_two".to_vec(),
+            last_key: b"d_four".to_vec(),
+            record_count: 2,
+            data_size: 100,
+            data: Some(block_data),
+        };
+
+        let sstables = vec![block];
+
+        let result = merge_sstables(&memtable, sstables).unwrap();
+
+        assert_eq!(result.len(), 5, "Should have 5 records");
+
+        // Verify strictly ascending order
+        assert_eq!(result[0].key, b"a_first");
+        assert_eq!(result[1].key, b"b_two");
+        assert_eq!(result[2].key, b"d_four");
+        assert_eq!(result[3].key, b"m_middle");
+        assert_eq!(result[4].key, b"z_last");
+
+        // Verify each subsequent key is greater than the previous
+        for i in 1..result.len() {
+            assert!(
+                result[i].key > result[i - 1].key,
+                "Records should be in ascending order by key"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_sstables_empty_block_data() {
+        // Test that blocks with None data field are handled correctly
+        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+        memtable.insert(b"key1", (RecordType::Put, b"value1"));
+
+        // Create block with None data
+        let block = Block {
+            offset: 0,
+            first_key: b"key2".to_vec(),
+            last_key: b"key2".to_vec(),
+            record_count: 0,
+            data_size: 0,
+            data: None, // No data
+        };
+
+        let sstables = vec![block];
+
+        let result = merge_sstables(&memtable, sstables).unwrap();
+
+        // Should only have memtable record since block has no data
+        assert_eq!(result.len(), 1, "Should have 1 record from memtable");
+        assert_eq!(result[0].key, b"key1");
     }
 }

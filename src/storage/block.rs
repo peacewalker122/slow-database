@@ -1,4 +1,7 @@
-use std::io::{Cursor, Seek, SeekFrom};
+use std::{
+    collections::BTreeMap,
+    io::{Cursor, Seek, SeekFrom},
+};
 
 use crate::{
     error::DBError,
@@ -23,7 +26,7 @@ pub struct Block<'a> {
     pub data_size: u32,
 
     /// Add this when decode the data / load the data
-    pub data: Option<Vec<Record<'a>>>,
+    pub data: Option<BTreeMap<&'a [u8], Record<'a>>>,
 }
 
 /// Builder for creating fixed-size blocks
@@ -159,7 +162,7 @@ impl<'a> Block<'a> {
         let data_size = u32::from_be_bytes(slice[pos..pos + 4].try_into()?);
         pos += 4;
 
-        let mut records = Vec::new();
+        let mut records = BTreeMap::new();
         for _ in 0..record_count {
             // we want to traverse and decode each record that available in
             // this block
@@ -168,7 +171,7 @@ impl<'a> Block<'a> {
             // move the pos to next record
             pos = data.position() as usize;
 
-            records.push(record);
+            records.insert(record.key, record);
         }
 
         Ok(Block {
@@ -197,7 +200,7 @@ mod tests {
 
         // Add a small record
         let key1 = b"key1";
-        let record = Record::new(key1, b"value1", RecordType::Put);
+        let record = Record::new(key1, b"value1", RecordType::Put, 1000);
         let record_bytes = record.encode();
 
         let result = builder.add_record(&record);
@@ -208,7 +211,7 @@ mod tests {
         // Try to add a record that would exceed block size
         let key2 = b"key2";
         let large_value = vec![0u8; SSTABLE_BLOCK_SIZE];
-        let large_record = Record::new(key2, &large_value, RecordType::Put);
+        let large_record = Record::new(key2, &large_value, RecordType::Put, 2000);
         let _large_record_bytes = large_record.encode();
 
         let result = builder.add_record(&large_record);
@@ -230,10 +233,12 @@ mod tests {
 
         // verify the record was decoded correctly in block.data
         assert!(block.data.is_some(), "block.data should be populated");
-        let records = block.data.unwrap();
+        let records = block.data.as_ref().unwrap();
         assert_eq!(records.len(), 1, "block should contain 1 record");
 
-        let decoded_record = &records[0];
+        let decoded_record = records
+            .get(b"key1" as &[u8])
+            .expect("Key 'key1' should exist");
         assert_eq!(decoded_record.key, b"key1");
         assert_eq!(decoded_record.value, b"value1");
         assert_eq!(decoded_record.record_type, RecordType::Put);
@@ -248,7 +253,7 @@ mod tests {
         let mut builder = BlockBuilder::new(0);
         let key = b"test_key";
         let value = b"test_value";
-        let record = Record::new(key, value, RecordType::Put);
+        let record = Record::new(key, value, RecordType::Put, 1000);
         builder.add_record(&record).unwrap();
         let (_, data) = builder.build().unwrap();
 
@@ -258,11 +263,16 @@ mod tests {
 
         // Assert: block.data should contain exactly 1 record with correct values
         assert!(block.data.is_some(), "block.data should be Some");
-        let records = block.data.unwrap();
+        let records = block.data.as_ref().unwrap();
         assert_eq!(records.len(), 1, "block should contain exactly 1 record");
-        assert_eq!(records[0].key, b"test_key");
-        assert_eq!(records[0].value, b"test_value");
-        assert_eq!(records[0].record_type, RecordType::Put);
+
+        let decoded_record = records
+            .get(b"test_key" as &[u8])
+            .expect("Key 'test_key' should exist");
+
+        assert_eq!(decoded_record.key, b"test_key");
+        assert_eq!(decoded_record.value, b"test_value");
+        assert_eq!(decoded_record.record_type, RecordType::Put);
     }
 
     #[test]
@@ -280,7 +290,7 @@ mod tests {
         ];
 
         for (key, value) in &records_data {
-            let record = Record::new(key, value, RecordType::Put);
+            let record = Record::new(key, value, RecordType::Put, 1000);
             builder.add_record(&record).unwrap();
         }
         let (_, data) = builder.build().unwrap();
@@ -291,30 +301,34 @@ mod tests {
 
         // Assert: block.data should contain all 4 records in correct order
         assert!(block.data.is_some(), "block.data should be Some");
-        let decoded_records = block.data.unwrap();
+        let decoded_records = block.data.as_ref().unwrap();
         assert_eq!(
             decoded_records.len(),
             4,
             "block should contain exactly 4 records"
         );
 
-        // Verify each record matches expected data in insertion order
-        for (i, (expected_key, expected_value)) in records_data.iter().enumerate() {
+        // Verify each record matches expected data by key lookup
+        // Note: BTreeMap sorts by key, so keys will be in sorted order
+        for (expected_key, expected_value) in records_data.iter() {
+            let record = decoded_records
+                .get(*expected_key as &[u8])
+                .expect(&format!("Key {:?} should exist", expected_key));
             assert_eq!(
-                decoded_records[i].key, *expected_key,
-                "Record {} key mismatch",
-                i
+                record.key, *expected_key,
+                "Key mismatch for {:?}",
+                expected_key
             );
             assert_eq!(
-                decoded_records[i].value, *expected_value,
-                "Record {} value mismatch",
-                i
+                record.value, *expected_value,
+                "Value mismatch for key {:?}",
+                expected_key
             );
             assert_eq!(
-                decoded_records[i].record_type,
+                record.record_type,
                 RecordType::Put,
-                "Record {} type mismatch",
-                i
+                "Record type mismatch for key {:?}",
+                expected_key
             );
         }
     }
@@ -328,17 +342,17 @@ mod tests {
         let mut builder = BlockBuilder::new(0);
 
         // Add 2 Put records
-        let record1 = Record::new(b"key1", b"value1", RecordType::Put);
+        let record1 = Record::new(b"key1", b"value1", RecordType::Put, 1000);
         builder.add_record(&record1).unwrap();
 
-        let record2 = Record::new(b"key2", b"value2", RecordType::Put);
+        let record2 = Record::new(b"key2", b"value2", RecordType::Put, 2000);
         builder.add_record(&record2).unwrap();
 
         // Add 2 Delete (tombstone) records
-        let record3 = Record::tombstone(b"key3");
+        let record3 = Record::tombstone(b"key3", 3000);
         builder.add_record(&record3).unwrap();
 
-        let record4 = Record::tombstone(b"key4");
+        let record4 = Record::tombstone(b"key4", 4000);
         builder.add_record(&record4).unwrap();
 
         let (_, data) = builder.build().unwrap();
@@ -349,49 +363,55 @@ mod tests {
 
         // Assert: All 4 records should be decoded with correct types
         assert!(block.data.is_some(), "block.data should be Some");
-        let decoded_records = block.data.unwrap();
+        let decoded_records = block.data.as_ref().unwrap();
         assert_eq!(
             decoded_records.len(),
             4,
             "block should contain exactly 4 records"
         );
 
-        // Verify record types are preserved
+        // Verify record types are preserved - access by key
+        let record0 = decoded_records
+            .get(b"key1" as &[u8])
+            .expect("Key 'key1' should exist");
         assert_eq!(
-            decoded_records[0].record_type,
+            record0.record_type,
             RecordType::Put,
             "Record 0 should be Put"
         );
-        assert_eq!(decoded_records[0].key, b"key1");
+        assert_eq!(record0.key, b"key1");
 
+        let record1 = decoded_records
+            .get(b"key2" as &[u8])
+            .expect("Key 'key2' should exist");
         assert_eq!(
-            decoded_records[1].record_type,
+            record1.record_type,
             RecordType::Put,
             "Record 1 should be Put"
         );
-        assert_eq!(decoded_records[1].key, b"key2");
+        assert_eq!(record1.key, b"key2");
 
+        let record2 = decoded_records
+            .get(b"key3" as &[u8])
+            .expect("Key 'key3' should exist");
         assert_eq!(
-            decoded_records[2].record_type,
+            record2.record_type,
             RecordType::Delete,
             "Record 2 should be Delete"
         );
-        assert_eq!(decoded_records[2].key, b"key3");
-        assert_eq!(
-            decoded_records[2].value, b"",
-            "Delete records should have empty value"
-        );
+        assert_eq!(record2.key, b"key3");
+        assert_eq!(record2.value, b"", "Delete records should have empty value");
 
+        let record3 = decoded_records
+            .get(b"key4" as &[u8])
+            .expect("Key 'key4' should exist");
         assert_eq!(
-            decoded_records[3].record_type,
+            record3.record_type,
             RecordType::Delete,
             "Record 3 should be Delete"
         );
-        assert_eq!(decoded_records[3].key, b"key4");
-        assert_eq!(
-            decoded_records[3].value, b"",
-            "Delete records should have empty value"
-        );
+        assert_eq!(record3.key, b"key4");
+        assert_eq!(record3.value, b"", "Delete records should have empty value");
     }
 
     #[test]
@@ -404,18 +424,18 @@ mod tests {
 
         // Short key (4 bytes)
         let short_key = b"key1";
-        let record1 = Record::new(short_key, b"value1", RecordType::Put);
+        let record1 = Record::new(short_key, b"value1", RecordType::Put, 1000);
         builder.add_record(&record1).unwrap();
 
         // Medium key (50 bytes)
         let medium_key = b"medium_key_with_exactly_50_bytes_in_total_here!!!!";
         assert_eq!(medium_key.len(), 50, "Medium key should be 50 bytes");
-        let record2 = Record::new(medium_key, b"value2", RecordType::Put);
+        let record2 = Record::new(medium_key, b"value2", RecordType::Put, 2000);
         builder.add_record(&record2).unwrap();
 
         // Long key (200 bytes)
         let long_key = vec![b'x'; 200];
-        let record3 = Record::new(&long_key, b"value3", RecordType::Put);
+        let record3 = Record::new(&long_key, b"value3", RecordType::Put, 3000);
         builder.add_record(&record3).unwrap();
 
         let (_, data) = builder.build().unwrap();
@@ -426,7 +446,7 @@ mod tests {
 
         // Assert: All 3 records should be decoded with correct key sizes
         assert!(block.data.is_some(), "block.data should be Some");
-        let decoded_records = block.data.unwrap();
+        let decoded_records = block.data.as_ref().unwrap();
         assert_eq!(
             decoded_records.len(),
             3,
@@ -434,32 +454,25 @@ mod tests {
         );
 
         // Verify short key
-        assert_eq!(decoded_records[0].key, short_key, "Short key mismatch");
-        assert_eq!(
-            decoded_records[0].key.len(),
-            4,
-            "Short key should be 4 bytes"
-        );
+        let record0 = decoded_records
+            .get(short_key as &[u8])
+            .expect("Short key should exist");
+        assert_eq!(record0.key, short_key, "Short key mismatch");
+        assert_eq!(record0.key.len(), 4, "Short key should be 4 bytes");
 
         // Verify medium key
-        assert_eq!(decoded_records[1].key, medium_key, "Medium key mismatch");
-        assert_eq!(
-            decoded_records[1].key.len(),
-            50,
-            "Medium key should be 50 bytes"
-        );
+        let record1 = decoded_records
+            .get(medium_key as &[u8])
+            .expect("Medium key should exist");
+        assert_eq!(record1.key, medium_key, "Medium key mismatch");
+        assert_eq!(record1.key.len(), 50, "Medium key should be 50 bytes");
 
         // Verify long key
-        assert_eq!(
-            decoded_records[2].key,
-            long_key.as_slice(),
-            "Long key mismatch"
-        );
-        assert_eq!(
-            decoded_records[2].key.len(),
-            200,
-            "Long key should be 200 bytes"
-        );
+        let record2 = decoded_records
+            .get(long_key.as_slice() as &[u8])
+            .expect("Long key should exist");
+        assert_eq!(record2.key, long_key.as_slice(), "Long key mismatch");
+        assert_eq!(record2.key.len(), 200, "Long key should be 200 bytes");
     }
 
     #[test]
@@ -469,8 +482,8 @@ mod tests {
 
         // Arrange: Create a block with known size
         let mut builder = BlockBuilder::new(0);
-        let record1 = Record::new(b"key1", b"value1", RecordType::Put);
-        let record2 = Record::new(b"key2", b"value2", RecordType::Put);
+        let record1 = Record::new(b"key1", b"value1", RecordType::Put, 1000);
+        let record2 = Record::new(b"key2", b"value2", RecordType::Put, 2000);
         builder.add_record(&record1).unwrap();
         builder.add_record(&record2).unwrap();
 
@@ -496,7 +509,7 @@ mod tests {
         // Also verify block.data was populated
         assert!(block.data.is_some(), "block.data should be populated");
         assert_eq!(
-            block.data.unwrap().len(),
+            block.data.as_ref().unwrap().len(),
             2,
             "block should contain 2 records"
         );
@@ -509,7 +522,7 @@ mod tests {
 
         // Arrange: Build a valid block, then corrupt a byte in the record data
         let mut builder = BlockBuilder::new(0);
-        let record = Record::new(b"key1", b"value1", RecordType::Put);
+        let record = Record::new(b"key1", b"value1", RecordType::Put, 1000);
         builder.add_record(&record).unwrap();
         let (block_metadata, mut data) = builder.build().unwrap();
 
@@ -517,9 +530,9 @@ mod tests {
         let header_size = block_metadata.encode().len();
 
         // Corrupt a byte in the record data section (corrupt the value, not the key or metadata)
-        // Record format: 1 (type) + 8 (key_len) + 8 (val_len) + key + value + 4 (checksum)
+        // Record format: 1 (type) + 8 (timestamp) + 8 (key_len) + 8 (val_len) + key + value + 4 (checksum)
         // Corrupt the first byte of the value
-        let corruption_offset = header_size + 1 + 8 + 8 + 4; // After metadata and key
+        let corruption_offset = header_size + 1 + 8 + 8 + 8 + 4; // After metadata and key
         if corruption_offset < data.len() {
             data[corruption_offset] ^= 0xFF; // Flip all bits
         }
@@ -540,7 +553,7 @@ mod tests {
 
         // Arrange: Manually construct a block with invalid record_count
         let mut builder = BlockBuilder::new(0);
-        let record = Record::new(b"key1", b"value1", RecordType::Put);
+        let record = Record::new(b"key1", b"value1", RecordType::Put, 1000);
         builder.add_record(&record).unwrap();
         let (mut block_metadata, data) = builder.build().unwrap();
 

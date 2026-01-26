@@ -11,6 +11,9 @@ pub enum DBError {
     #[error("Corrupted page: {0}")]
     Corrupted(String),
 
+    #[error("storage error: {0}")]
+    StorageError(String),
+
     #[error("key not found")]
     NotFound,
 }

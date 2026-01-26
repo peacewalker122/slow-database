@@ -7,8 +7,8 @@ use crate::{
     storage::{
         self,
         log::{
-            RecordType, read_sstable_bloom, read_sstable_footer, read_sstable_sparse_index,
-            search_sstable_sparse,
+            read_sstable_bloom, read_sstable_footer, read_sstable_sparse_index,
+            search_sstable_sparse, RecordType,
         },
         manifest,
     },
@@ -206,7 +206,7 @@ impl KVEngine for PersistentKV {
             self.memtable_size = 0;
 
             std::thread::spawn(move || {
-                if let Err(e) = storage::log::flush_memtable(old_memtable, 0, file_id) {
+                if let Err(e) = storage::log::flush_memtable(&old_memtable, "app.db", 0, file_id) {
                     log::error!("Failed to flush memtable to SSTable: {}", e);
                 }
             });

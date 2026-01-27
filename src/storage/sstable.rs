@@ -1,8 +1,8 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap},
-    fs::OpenOptions,
-    io::{Read, Seek, SeekFrom, Write},
+    fs::{File, OpenOptions},
+    io::{BufReader, Read, Seek, SeekFrom, Write},
 };
 
 use crossbeam_skiplist::SkipMap;
@@ -23,17 +23,12 @@ struct SSTable<'a> {
 }
 
 impl<'a> SSTable<'a> {
-    pub fn decode(data: &'a [u8]) -> Result<Self, DBError> {
-        let mut cursor = std::io::Cursor::new(data);
+    pub fn decode(mut file: File) -> Result<Self, DBError> {
+        let mut cursor = BufReader::new(&mut file);
 
         // Read footer
         cursor.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
         let footer = SSTableFooter::decode(&mut cursor)?;
-
-        let mut blocks = Vec::new();
-        let mut block_data = vec![0u8; (footer.data_block_end - footer.data_block_start) as usize];
-        cursor.seek(SeekFrom::Start(footer.data_block_start))?;
-        cursor.read_exact(&mut block_data)?;
 
         // Read index block
         cursor.seek(SeekFrom::Start(footer.index_block_start))?;
@@ -53,16 +48,25 @@ impl<'a> SSTable<'a> {
         index_cursor.read_exact(&mut count_buf)?;
         let entry_count = u64::from_be_bytes(count_buf);
 
-        // Read all index entries
+        let mut block_buf = vec![0u8; (footer.data_block_end - footer.data_block_start) as usize];
+        cursor.seek(SeekFrom::Start(footer.data_block_start))?;
+        cursor.read_exact(&mut block_buf)?;
+
+        // Leak the buffer to create a 'static lifetime reference
+        // This allows Block<'a> to safely borrow from this data
+        // NOTE: This intentionally leaks memory (acceptable for testing/prototyping)
+        let block_data_static: &'static [u8] = Box::leak(block_buf.into_boxed_slice());
+        let mut block_cursor = std::io::Cursor::new(block_data_static);
+
+        // Read all index entries and decode blocks
+        let mut blocks = Vec::new();
         for _ in 0..entry_count {
             let entry = SparseIndexEntry::decode(&mut index_cursor)?;
             let offset = entry.block_offset;
             index.push(entry);
 
-            // start from the offset. On each offset we decode the heeader -> parse block data in
-            // return we will get the key-value pairs on what we already stored
-            let block = Block::decode(&mut cursor, offset)?;
-
+            // Decode the block from the static data
+            let block = Block::decode(&mut block_cursor, offset)?;
             blocks.push(block);
         }
 
@@ -356,7 +360,6 @@ fn verify_bloom_checksum(data: &[u8], expected: u32) -> Result<(), std::io::Erro
 /// # File Naming Convention
 /// Files are named as: `app-L{level}-{file_id}.db`
 /// Example: `app-L0-1735948800.db` for a Level 0 SSTable with timestamp ID
-
 static DBFILENAME: &str = "app.db";
 pub fn flush_memtable(
     memtable: &SkipMap<Vec<u8>, (RecordType, Vec<u8>)>,
@@ -370,55 +373,133 @@ pub fn flush_memtable(
         memtable.len()
     );
 
-    // read file or create if not exists
+    // Check if file exists and has data to merge
+    let file_exists = std::path::Path::new(filename).exists();
+    let existing_blocks = if file_exists {
+        let existing_file = File::open(filename)?;
+        let file_size = existing_file.metadata()?.len();
+
+        if file_size > FOOTER_SIZE {
+            // File has data, decode it
+            log::info!("Existing SSTable found, will merge with memtable");
+            match SSTable::decode(existing_file) {
+                Ok(sstable) => {
+                    log::info!(
+                        "Decoded {} existing blocks for merging",
+                        sstable.block.len()
+                    );
+                    sstable.block
+                }
+                Err(e) => {
+                    log::warn!("Failed to decode existing SSTable, will overwrite: {:?}", e);
+                    Vec::new()
+                }
+            }
+        } else {
+            log::debug!("Existing file is empty or incomplete, will overwrite");
+            Vec::new()
+        }
+    } else {
+        log::debug!("No existing SSTable found, creating new one");
+        Vec::new()
+    };
+
+    // Create owned copies of memtable data and leak to get 'static lifetime
+    // This is necessary because Record<'a> holds borrowed references
+    let mut memtable_data: Vec<(Vec<u8>, RecordType, Vec<u8>)> = Vec::new();
+    for entry in memtable.iter() {
+        let key = entry.key().clone();
+        let (record_type, value) = entry.value();
+        memtable_data.push((key, *record_type, value.clone()));
+    }
+
+    // Leak the data to get 'static lifetime
+    let memtable_static: &'static [(Vec<u8>, RecordType, Vec<u8>)] =
+        Box::leak(memtable_data.into_boxed_slice());
+
+    // Perform merge if we have existing blocks
+    let records_to_write: Vec<Record<'static>> = if !existing_blocks.is_empty() {
+        log::info!(
+            "Merging memtable with {} existing blocks",
+            existing_blocks.len()
+        );
+
+        // Convert to SkipMap with static references
+        let memtable_refs: SkipMap<&'static [u8], (RecordType, &'static [u8])> = SkipMap::new();
+        for (key, record_type, value) in memtable_static.iter() {
+            memtable_refs.insert(key.as_slice(), (*record_type, value.as_slice()));
+        }
+
+        // Merge and get sorted records
+        match merge_sstables(&memtable_refs, existing_blocks) {
+            Ok(merged) => {
+                log::info!("Merge completed, writing {} records", merged.len());
+                merged
+            }
+            Err(e) => {
+                log::error!("Merge failed: {:?}, falling back to memtable only", e);
+                // Fallback: convert memtable directly from static data
+                memtable_static
+                    .iter()
+                    .map(|(key, record_type, value)| {
+                        Record::new(
+                            key.as_slice(),
+                            value.as_slice(),
+                            *record_type,
+                            crate::storage::record::current_timestamp_millis(),
+                        )
+                    })
+                    .collect()
+            }
+        }
+    } else {
+        // No existing data, just convert memtable to records from static data
+        log::debug!("No merge needed, writing memtable only");
+        memtable_static
+            .iter()
+            .map(|(key, record_type, value)| {
+                Record::new(
+                    key.as_slice(),
+                    value.as_slice(),
+                    *record_type,
+                    crate::storage::record::current_timestamp_millis(),
+                )
+            })
+            .collect()
+    };
+
+    // Now write merged/new data to file (truncate and rewrite)
     let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(true) // Overwrite existing content
         .create(true)
-        .append(true)
         .open(filename)?;
 
-    // TODO: do the merge in here first for the memtable & data from existing sstables
-
-    let data_block_start = file.metadata()?.len();
+    let data_block_start = 0u64; // Starting from beginning of file
 
     // Build sparse index and bloom filter as we write data blocks
     let mut sparse_index: Vec<SparseIndexEntry> = Vec::new();
     let mut blocks: Vec<Vec<u8>> = Vec::new();
 
-    // Create Bloom filter with 1% false positive rate
-    let mut bloom_filter = BloomFilter::with_rate(memtable.len(), 0.01);
+    // Create Bloom filter with appropriate capacity
+    let mut bloom_filter = BloomFilter::with_rate(records_to_write.len(), 0.01);
 
     // Create first block builder
     let mut current_offset = data_block_start;
     let mut block_builder = BlockBuilder::new(current_offset);
 
-    log::debug!("Writing records to 4KB blocks...");
+    log::debug!(
+        "Writing {} records to 4KB blocks...",
+        records_to_write.len()
+    );
 
-    // Write all records to blocks
-    for entry in memtable.iter() {
-        let key = entry.key();
-        let val = entry.value();
-
+    // Write all merged records to blocks
+    for record in records_to_write.iter() {
         // Insert key into Bloom filter
-        bloom_filter.insert(key);
-
-        // Encode the record with sequential LSN
-        let record = match val.0 {
-            RecordType::Delete => Record::new(
-                key,
-                &val.1,
-                RecordType::Delete,
-                crate::storage::record::current_timestamp_millis(),
-            ),
-            RecordType::Put => Record::new(
-                key,
-                &val.1,
-                RecordType::Put,
-                crate::storage::record::current_timestamp_millis(),
-            ),
-        };
+        bloom_filter.insert(record.key);
 
         // Try to add record to current block
-        match block_builder.add_record(&record) {
+        match block_builder.add_record(record) {
             Ok(()) => {
                 // Record added successfully
             }
@@ -450,7 +531,7 @@ pub fn flush_memtable(
                 // Create new block and add the record that didn't fit
                 block_builder = BlockBuilder::new(current_offset);
                 block_builder
-                    .add_record(&record)
+                    .add_record(record)
                     .expect("Fresh block should have space for record");
             }
         }
@@ -1133,14 +1214,14 @@ mod tests {
 
         flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
-        // Read the file back
-        let sstable_data = std::fs::read(&filename).unwrap();
+        // Open the file for decoding
+        let file = File::open(&filename).unwrap();
+
+        // Decode SSTable
+        let decoded = SSTable::decode(file).unwrap();
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
-
-        // Decode SSTable
-        let decoded = SSTable::decode(&sstable_data).unwrap();
 
         // Verify decoded structure
         assert_eq!(decoded.block.len(), 1, "Should have exactly one block");
@@ -1200,14 +1281,14 @@ mod tests {
 
         flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
-        // Read the file back
-        let sstable_data = std::fs::read(&filename).unwrap();
+        // Open the file for decoding
+        let file = File::open(&filename).unwrap();
+
+        // Decode SSTable
+        let decoded = SSTable::decode(file).unwrap();
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
-
-        // Decode SSTable
-        let decoded = SSTable::decode(&sstable_data).unwrap();
 
         // Verify decoded structure
         assert_eq!(decoded.block.len(), 1, "Should have exactly one block");
@@ -1262,14 +1343,14 @@ mod tests {
 
         flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
-        // Read the file back
-        let sstable_data = std::fs::read(&filename).unwrap();
+        // Open the file for decoding
+        let file = File::open(&filename).unwrap();
+
+        // Decode SSTable
+        let decoded = SSTable::decode(file).unwrap();
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
-
-        // Decode SSTable
-        let decoded = SSTable::decode(&sstable_data).unwrap();
 
         // Verify empty structure
         assert_eq!(decoded.block.len(), 0, "Should have no blocks");
@@ -1294,24 +1375,30 @@ mod tests {
 
         flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
-        // Read the file back
+        // Read the file data to corrupt it
         let mut sstable_data = std::fs::read(&filename).unwrap();
-
-        // Clean up
-        std::fs::remove_file(&filename).unwrap();
 
         // Read footer to find index checksum location
         let footer_offset = sstable_data.len() - FOOTER_SIZE as usize;
         let footer_data = &sstable_data[footer_offset..];
         let mut cursor = std::io::Cursor::new(footer_data);
-        let footer = SSTableFooter::decode(&mut cursor).unwrap();
+        let _footer = SSTableFooter::decode(&mut cursor).unwrap();
 
         // Corrupt the index checksum in the footer (offset 32 in footer: 4 u64s = 32 bytes)
         let checksum_offset = footer_offset + 32;
         sstable_data[checksum_offset] ^= 0xFF; // Flip bits
 
+        // Write corrupted data back
+        std::fs::write(&filename, &sstable_data).unwrap();
+
+        // Open the corrupted file for decoding
+        let file = File::open(&filename).unwrap();
+
         // Decode should fail with IO error (checksum validation happens in verify_index_checksum)
-        let result = SSTable::decode(&sstable_data);
+        let result = SSTable::decode(file);
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
         assert!(result.is_err());
         match result.unwrap_err() {
             DBError::IO(_) => {} // Expected: IO error from checksum mismatch
@@ -1337,19 +1424,25 @@ mod tests {
 
         flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
-        // Read the file back
+        // Read the file data to corrupt it
         let mut sstable_data = std::fs::read(&filename).unwrap();
-
-        // Clean up
-        std::fs::remove_file(&filename).unwrap();
 
         // Corrupt the bloom checksum in the footer (offset 48 in footer: 6 u64s = 48 bytes)
         let footer_offset = sstable_data.len() - FOOTER_SIZE as usize;
         let checksum_offset = footer_offset + 48;
         sstable_data[checksum_offset] ^= 0xFF; // Flip bits
 
+        // Write corrupted data back
+        std::fs::write(&filename, &sstable_data).unwrap();
+
+        // Open the corrupted file for decoding
+        let file = File::open(&filename).unwrap();
+
         // Decode should fail with IO error (checksum validation happens in verify_bloom_checksum)
-        let result = SSTable::decode(&sstable_data);
+        let result = SSTable::decode(file);
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
         assert!(result.is_err());
         match result.unwrap_err() {
             DBError::IO(_) => {} // Expected: IO error from checksum mismatch
@@ -1375,18 +1468,24 @@ mod tests {
 
         flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
-        // Read the file back
+        // Read the file data to corrupt it
         let mut sstable_data = std::fs::read(&filename).unwrap();
-
-        // Clean up
-        std::fs::remove_file(&filename).unwrap();
 
         // Corrupt the footer checksum (last 4 bytes of the file)
         let len = sstable_data.len();
         sstable_data[len - 1] ^= 0xFF;
 
+        // Write corrupted data back
+        std::fs::write(&filename, &sstable_data).unwrap();
+
+        // Open the corrupted file for decoding
+        let file = File::open(&filename).unwrap();
+
         // Decode should fail with IO error (checksum validation happens in SSTableFooter::decode)
-        let result = SSTable::decode(&sstable_data);
+        let result = SSTable::decode(file);
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
         assert!(result.is_err());
         match result.unwrap_err() {
             DBError::IO(_) => {} // Expected: IO error from checksum mismatch
@@ -1409,19 +1508,25 @@ mod tests {
 
         flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
-        // Read the file back
+        // Read the file data to corrupt it
         let mut sstable_data = std::fs::read(&filename).unwrap();
-
-        // Clean up
-        std::fs::remove_file(&filename).unwrap();
 
         // Corrupt the magic number in footer (offset 52 in footer: 6 u64s + 2 u32s = 56 bytes, magic at 52)
         let footer_offset = sstable_data.len() - FOOTER_SIZE as usize;
         let magic_offset = footer_offset + 52;
         sstable_data[magic_offset] ^= 0xFF; // Flip bits
 
+        // Write corrupted data back
+        std::fs::write(&filename, &sstable_data).unwrap();
+
+        // Open the corrupted file for decoding
+        let file = File::open(&filename).unwrap();
+
         // Decode should fail with IO error (magic number validation happens in SSTableFooter::decode)
-        let result = SSTable::decode(&sstable_data);
+        let result = SSTable::decode(file);
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
         assert!(result.is_err());
         match result.unwrap_err() {
             DBError::IO(_) => {} // Expected: IO error from invalid magic number
@@ -1449,14 +1554,14 @@ mod tests {
 
         flush_memtable(&memtable, &filename, 0, file_id).unwrap();
 
-        // Read the file back
-        let sstable_data = std::fs::read(&filename).unwrap();
+        // Open the file for decoding
+        let file = File::open(&filename).unwrap();
+
+        // Decode SSTable
+        let decoded = SSTable::decode(file).unwrap();
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
-
-        // Decode and verify bloom filter
-        let decoded = SSTable::decode(&sstable_data).unwrap();
 
         // Verify block metadata
         assert_eq!(decoded.block.len(), 1, "Should have exactly one block");
@@ -1530,10 +1635,14 @@ mod tests {
         );
 
         flush_memtable(&memtable, &filename, 0, file_id).unwrap();
-        let sstable_data = std::fs::read(&filename).unwrap();
-        std::fs::remove_file(&filename).unwrap();
 
-        let decoded = SSTable::decode(&sstable_data).unwrap();
+        // Open the file for decoding
+        let file = File::open(&filename).unwrap();
+
+        let decoded = SSTable::decode(file).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
 
         // Assert: Verify block.data field is populated with 1 record
         assert_eq!(decoded.block.len(), 1, "Should have exactly one block");
@@ -1587,10 +1696,14 @@ mod tests {
         );
 
         flush_memtable(&memtable, &filename, 0, file_id).unwrap();
-        let sstable_data = std::fs::read(&filename).unwrap();
-        std::fs::remove_file(&filename).unwrap();
 
-        let decoded = SSTable::decode(&sstable_data).unwrap();
+        // Open the file for decoding
+        let file = File::open(&filename).unwrap();
+
+        let decoded = SSTable::decode(file).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
 
         // Assert: Verify block.data contains all 4 records in sorted order
         assert_eq!(decoded.block.len(), 1, "Should have exactly one block");
@@ -1673,10 +1786,14 @@ mod tests {
         );
 
         flush_memtable(&memtable, &filename, 0, file_id).unwrap();
-        let sstable_data = std::fs::read(&filename).unwrap();
-        std::fs::remove_file(&filename).unwrap();
 
-        let decoded = SSTable::decode(&sstable_data).unwrap();
+        // Open the file for decoding
+        let file = File::open(&filename).unwrap();
+
+        let decoded = SSTable::decode(file).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
 
         // Assert: Verify block.data contains all 3 records with correct types
         assert_eq!(decoded.block.len(), 1, "Should have exactly one block");
@@ -1771,10 +1888,14 @@ mod tests {
         );
 
         flush_memtable(&memtable, &filename, 0, file_id).unwrap();
-        let sstable_data = std::fs::read(&filename).unwrap();
-        std::fs::remove_file(&filename).unwrap();
 
-        let decoded = SSTable::decode(&sstable_data).unwrap();
+        // Open the file for decoding
+        let file = File::open(&filename).unwrap();
+
+        let decoded = SSTable::decode(file).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&filename).unwrap();
 
         // Assert: Verify block.data is populated for ALL blocks (whether 1 or more)
         assert!(decoded.block.len() >= 1, "Should have at least 1 block");
@@ -2229,5 +2350,193 @@ mod tests {
         // Should only have memtable record since block has no data
         assert_eq!(result.len(), 1, "Should have 1 record from memtable");
         assert_eq!(result[0].key, b"key1");
+    }
+
+    #[test]
+    fn test_flush_memtable_merge_with_existing_sstable() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Test that flush_memtable correctly merges with existing SSTable data
+        static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let file_id = FILE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let filename = format!("test_flush_merge_{}.db", file_id);
+
+        // Step 1: Create initial SSTable with 3 records
+        let memtable1 = SkipMap::new();
+        memtable1.insert(b"apple".to_vec(), (RecordType::Put, b"red".to_vec()));
+        memtable1.insert(b"banana".to_vec(), (RecordType::Put, b"yellow".to_vec()));
+        memtable1.insert(b"cherry".to_vec(), (RecordType::Put, b"dark_red".to_vec()));
+
+        flush_memtable(&memtable1, &filename, 0, file_id).unwrap();
+
+        // Verify initial SSTable was created
+        assert!(
+            std::path::Path::new(&filename).exists(),
+            "Initial SSTable should be created"
+        );
+
+        // Step 2: Create second memtable with overlapping and new keys
+        let memtable2 = SkipMap::new();
+        // Update existing key (should win due to newer timestamp)
+        memtable2.insert(b"banana".to_vec(), (RecordType::Put, b"green".to_vec()));
+        // Add new keys
+        memtable2.insert(b"date".to_vec(), (RecordType::Put, b"brown".to_vec()));
+        memtable2.insert(
+            b"elderberry".to_vec(),
+            (RecordType::Put, b"purple".to_vec()),
+        );
+        // Delete an existing key
+        memtable2.insert(b"cherry".to_vec(), (RecordType::Delete, b"".to_vec()));
+
+        // Step 3: Flush second memtable to same file (should trigger merge)
+        flush_memtable(&memtable2, &filename, 0, file_id).unwrap();
+
+        // Step 4: Decode the merged SSTable and verify results
+        let file = File::open(&filename).unwrap();
+        let sstable = SSTable::decode(file).unwrap();
+
+        // Collect all records from all blocks
+        let mut all_records = Vec::new();
+        for block in &sstable.block {
+            if let Some(ref data) = block.data {
+                for (_key, record) in data.iter() {
+                    all_records.push(record);
+                }
+            }
+        }
+
+        // Should have 5 unique keys: apple, banana (updated), cherry (deleted), date, elderberry
+        assert_eq!(
+            all_records.len(),
+            5,
+            "Should have 5 records after merge (3 original + 2 new)"
+        );
+
+        // Verify keys are sorted
+        let keys: Vec<&[u8]> = all_records.iter().map(|r| r.key).collect();
+        assert_eq!(keys[0], b"apple");
+        assert_eq!(keys[1], b"banana");
+        assert_eq!(keys[2], b"cherry");
+        assert_eq!(keys[3], b"date");
+        assert_eq!(keys[4], b"elderberry");
+
+        // Verify values and record types
+        assert_eq!(all_records[0].value, b"red"); // apple unchanged
+        assert_eq!(all_records[0].record_type, RecordType::Put);
+
+        assert_eq!(all_records[1].value, b"green"); // banana updated to green
+        assert_eq!(all_records[1].record_type, RecordType::Put);
+
+        assert_eq!(all_records[2].record_type, RecordType::Delete); // cherry deleted
+        assert_eq!(all_records[2].value, b""); // Delete records have empty value
+
+        assert_eq!(all_records[3].value, b"brown"); // date is new
+        assert_eq!(all_records[3].record_type, RecordType::Put);
+
+        assert_eq!(all_records[4].value, b"purple"); // elderberry is new
+        assert_eq!(all_records[4].record_type, RecordType::Put);
+
+        // Verify timestamps (newer records should have higher timestamps)
+        // banana (updated) should have a newer timestamp than apple (original)
+        assert!(
+            all_records[1].timestamp >= all_records[0].timestamp,
+            "Updated banana should have timestamp >= original apple"
+        );
+
+        // Cleanup
+        std::fs::remove_file(&filename).ok();
+    }
+
+    #[test]
+    fn test_flush_memtable_no_merge_on_new_file() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Test that flush_memtable works correctly with a new file (no merge needed)
+        static FILE_COUNTER: AtomicU64 = AtomicU64::new(1000);
+        let file_id = FILE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let filename = format!("test_flush_no_merge_{}.db", file_id);
+
+        // Ensure file doesn't exist
+        std::fs::remove_file(&filename).ok();
+
+        // Create memtable
+        let memtable = SkipMap::new();
+        memtable.insert(b"key1".to_vec(), (RecordType::Put, b"value1".to_vec()));
+        memtable.insert(b"key2".to_vec(), (RecordType::Put, b"value2".to_vec()));
+
+        // Flush to new file
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+
+        // Verify file was created
+        assert!(
+            std::path::Path::new(&filename).exists(),
+            "SSTable file should be created"
+        );
+
+        // Decode and verify
+        let file = File::open(&filename).unwrap();
+        let sstable = SSTable::decode(file).unwrap();
+
+        let mut all_records = Vec::new();
+        for block in &sstable.block {
+            if let Some(ref data) = block.data {
+                for (_key, record) in data.iter() {
+                    all_records.push(record);
+                }
+            }
+        }
+
+        assert_eq!(all_records.len(), 2, "Should have 2 records");
+        assert_eq!(all_records[0].key, b"key1");
+        assert_eq!(all_records[0].value, b"value1");
+        assert_eq!(all_records[1].key, b"key2");
+        assert_eq!(all_records[1].value, b"value2");
+
+        // Cleanup
+        std::fs::remove_file(&filename).ok();
+    }
+
+    #[test]
+    fn test_flush_memtable_merge_handles_empty_existing_file() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Test that flush_memtable handles an empty/incomplete existing file correctly
+        static FILE_COUNTER: AtomicU64 = AtomicU64::new(2000);
+        let file_id = FILE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let filename = format!("test_flush_empty_existing_{}.db", file_id);
+
+        // Create an empty file
+        File::create(&filename).unwrap();
+
+        // Verify file exists but is empty
+        let metadata = std::fs::metadata(&filename).unwrap();
+        assert_eq!(metadata.len(), 0, "File should be empty");
+
+        // Create memtable
+        let memtable = SkipMap::new();
+        memtable.insert(b"key1".to_vec(), (RecordType::Put, b"value1".to_vec()));
+
+        // Flush should handle empty file gracefully (no merge, just write)
+        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+
+        // Decode and verify
+        let file = File::open(&filename).unwrap();
+        let sstable = SSTable::decode(file).unwrap();
+
+        let mut all_records = Vec::new();
+        for block in &sstable.block {
+            if let Some(ref data) = block.data {
+                for (_key, record) in data.iter() {
+                    all_records.push(record);
+                }
+            }
+        }
+
+        assert_eq!(all_records.len(), 1, "Should have 1 record");
+        assert_eq!(all_records[0].key, b"key1");
+        assert_eq!(all_records[0].value, b"value1");
+
+        // Cleanup
+        std::fs::remove_file(&filename).ok();
     }
 }

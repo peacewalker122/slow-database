@@ -7,8 +7,8 @@ use crate::{
     storage::{
         self,
         log::{
-            read_sstable_bloom, read_sstable_footer, read_sstable_sparse_index,
-            search_sstable_sparse, RecordType,
+            RecordType, read_sstable_bloom, read_sstable_footer, read_sstable_sparse_index,
+            search_sstable_sparse,
         },
         manifest,
     },
@@ -212,10 +212,10 @@ impl KVEngine for PersistentKV {
             });
 
             // Level 0 (L0) is used for memtable flushes in LSM-tree
-            let filename = format!("app-L{}-{}.db", 0, file_id);
+            const filename: &str = "app.db";
 
             // Record file creation in manifest
-            manifest::add_file(0, &filename)?;
+            manifest::add_file(0, filename)?;
             log::debug!("Added {} to manifest at level 0", filename);
 
             // set the current memtable to a new one
@@ -261,27 +261,27 @@ mod tests {
         );
     }
 
-    // #[test]
-    // fn test_active_data() {
-    //     let mut kv = PersistentKV::new();
-    //
-    //     (1..10000)
-    //         .try_for_each(|i| -> Result<(), DBError> {
-    //             kv.put(
-    //                 format!("key{i}").as_bytes(),
-    //                 format!("valuefromkey{i}").as_bytes(),
-    //             )?;
-    //
-    //             Ok(())
-    //         })
-    //         .unwrap();
-    //
-    //     // check the missing one
-    //     let result = kv.get(b"keyyangemangkosong").unwrap();
-    //     assert_eq!(result, b"");
-    //
-    //     // check one of the exist key
-    //     let result2 = kv.get(b"key88").unwrap();
-    //     assert_eq!(result2, b"valuefromkey88");
-    // }
+    #[test]
+    fn test_active_data() {
+        let mut kv = PersistentKV::new();
+
+        (1..1000)
+            .try_for_each(|i| -> Result<(), DBError> {
+                kv.put(
+                    format!("key{i}").as_bytes(),
+                    format!("valuefromkey{i}").as_bytes(),
+                )?;
+
+                Ok(())
+            })
+            .unwrap();
+
+        // check the missing one
+        let result = kv.get(b"keyyangemangkosong").unwrap();
+        assert_eq!(result, b"");
+
+        // check one of the exist key
+        let result2 = kv.get(b"key88").unwrap();
+        assert_eq!(result2, b"valuefromkey88");
+    }
 }

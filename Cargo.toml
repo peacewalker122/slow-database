@@ -13,3 +13,10 @@ bloom = "0.2.0"
 clap = { version = "4.5", features = ["derive"] }
 uuid = { version = "1.11", features = ["v4"] }
 crossbeam-skiplist = "0.1"
+dhat = "0.3.3"
+
+[profile.release]
+debug = 1
+
+[features]
+dhat-heap = [] # Feature to toggle profiling

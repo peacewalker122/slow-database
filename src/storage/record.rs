@@ -254,15 +254,19 @@ pub fn decode_record<R: Read + Seek>(
 /// Encode a WAL record (backward compatibility)
 pub fn encode_record(key: &[u8], value: &[u8], lsn: u64) -> Vec<u8> {
     use super::wal::WALRecord;
-    let wal = WALRecord::new(key.to_vec(), value.to_vec(), RecordType::Put, lsn);
-    wal.encode()
+    let wal = WALRecord::new(key, value, RecordType::Put, lsn);
+    let mut buf = Vec::new();
+    wal.encode(&mut buf).expect("Failed to encode record");
+    buf
 }
 
 /// Encode a tombstone WAL record (backward compatibility)
 pub fn encode_tombstone_record(key: &[u8], lsn: u64) -> Vec<u8> {
     use super::wal::WALRecord;
-    let wal = WALRecord::new(key.to_vec(), vec![], RecordType::Delete, lsn);
-    wal.encode()
+    let wal = WALRecord::new(key, &[], RecordType::Delete, lsn);
+    let mut buf = Vec::new();
+    wal.encode(&mut buf).expect("Failed to encode record");
+    buf
 }
 
 #[cfg(test)]

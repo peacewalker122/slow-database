@@ -22,19 +22,18 @@ fn main() {
     info!("Performing sample operations...");
 
     trace!("About to put key1");
-    match kv.put(b"key1", b"value1") {
+    match kv.put(b"key1".to_vec(), b"value1".to_vec()) {
         Ok(_) => info!("Successfully stored key1"),
         Err(e) => error!("Failed to store key1: {}", e),
     }
 
     trace!("About to get key1");
     match kv.get(b"key1") {
-        Ok(val) => {
-            if !val.is_empty() {
-                info!("Retrieved key1: {:?}", String::from_utf8_lossy(&val));
-            } else {
-                warn!("key1 not found");
-            }
+        Ok(Some(val)) => {
+            info!("Retrieved key1: {:?}", String::from_utf8_lossy(&val));
+        }
+        Ok(None) => {
+            warn!("key1 not found");
         }
         Err(e) => error!("Failed to get key1: {}", e),
     }

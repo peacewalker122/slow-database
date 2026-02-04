@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap},
     fs::{File, OpenOptions},
@@ -852,16 +853,13 @@ pub fn read_sstable_bloom<R: Read + Seek>(
 
 /// Helper function to decode a record from a File/generic reader at an offset
 /// This reads the data into a buffer then decodes using Record::decode
-fn decode_record_from_file<R: Read + Seek>(
-    reader: &mut R,
-    offset: u64,
-) -> Result<(Vec<u8>, Vec<u8>, RecordType, u64), std::io::Error> {
-    reader.seek(SeekFrom::Start(offset))?;
-
+pub fn decode_record_from_file<'a>(
+    reader: &'a [u8],
+    mut offset: usize,
+) -> Result<(&'a [u8], &'a [u8], RecordType, usize), std::io::Error> {
     // Read record type
-    let mut record_type_buf = [0u8; 1];
-    reader.read_exact(&mut record_type_buf)?;
-    let record_type = match record_type_buf[0] {
+
+    let record_type = match reader[offset as usize] {
         1 => RecordType::Put,
         2 => RecordType::Delete,
         _ => {
@@ -871,27 +869,43 @@ fn decode_record_from_file<R: Read + Seek>(
             ));
         }
     };
+    offset += 1;
 
     // Read key length
-    let mut len_buf = [0u8; 8];
-    reader.read_exact(&mut len_buf)?;
+    let mut len_buf: [u8; 8] = reader[offset..offset + 8].try_into().or_else(|e| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to read key length: {:?}", e),
+        ))
+    })?;
     let key_len = u64::from_be_bytes(len_buf) as usize;
+    offset += 8;
 
     // Read value length
-    reader.read_exact(&mut len_buf)?;
+    len_buf = reader[offset..offset + 8].try_into().or_else(|e| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to read value length: {:?}", e),
+        ))
+    })?;
     let value_len = u64::from_be_bytes(len_buf) as usize;
+    offset += 8;
 
     // Read key
-    let mut key = vec![0u8; key_len];
-    reader.read_exact(&mut key)?;
+    let key = &reader[offset..offset + key_len];
+    offset += key_len;
 
     // Read value
-    let mut value = vec![0u8; value_len];
-    reader.read_exact(&mut value)?;
+    let value = &reader[offset..offset + value_len];
+    offset += value_len;
 
     // Read and verify checksum
-    let mut checksum_buf = [0u8; 4];
-    reader.read_exact(&mut checksum_buf)?;
+    let checksum_buf: [u8; 4] = reader[offset..offset + 4].try_into().or_else(|e| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to read checksum: {:?}", e),
+        ))
+    })?;
     let checksum = u32::from_be_bytes(checksum_buf);
 
     if crc32fast::hash(&value) != checksum {
@@ -902,18 +916,22 @@ fn decode_record_from_file<R: Read + Seek>(
     }
 
     // Calculate next offset
-    let next_offset = offset + 1 + 8 + 8 + key_len as u64 + value_len as u64 + 4;
+    let next_offset = offset + 1 + 8 + 8 + key_len + value_len + 4;
 
-    Ok((key, value, record_type, next_offset))
+    Ok((&key, &value, record_type, next_offset))
 }
 
 /// Search for a key in the SSTable using sparse index and linear block scan
 /// This is optimized for high-cardinality keys (like UUIDs)
-pub fn search_sstable_sparse<R: Read + Seek>(
+pub fn search_sstable_sparse<'a, R>(
     mut reader: R,
     key: &[u8],
     sparse_index: &[SparseIndexEntry],
-) -> Result<Option<Vec<u8>>, std::io::Error> {
+    buf: &'a mut Vec<u8>,
+) -> Result<Option<&'a [u8]>, std::io::Error>
+where
+    R: Read + Seek,
+{
     // Find the block that might contain the key using binary search
     // We need to find the block where: first_key <= key <= last_key
     let mut target_block: Option<&SparseIndexEntry> = None;
@@ -955,17 +973,18 @@ pub fn search_sstable_sparse<R: Read + Seek>(
     reader.seek(SeekFrom::Start(block.block_offset))?;
 
     // Read records in this block until we find the key or reach the end
-    let mut current_offset = block.block_offset;
+    let mut current_offset = block.block_offset as usize;
     let mut records_scanned = 0;
+    reader.read_to_end(buf);
 
     loop {
         // Try to read a record at current offset
-        match decode_record_from_file(&mut reader, current_offset) {
+        match decode_record_from_file(buf, current_offset as usize) {
             Ok((record_key, record_value, record_type, next_offset)) => {
                 records_scanned += 1;
 
                 // Check if this is our key
-                if record_key.as_slice() == key {
+                if record_key == key {
                     log::trace!("Key found after scanning {} records", records_scanned);
                     return match record_type {
                         RecordType::Put => Ok(Some(record_value)),
@@ -1004,13 +1023,16 @@ pub fn search_sstable<R: Read + Seek>(
     // Look up key in index
     if let Some(&offset) = index.get(key) {
         // Read the record at the offset
+
+        let buf = BufReader::new(&mut reader);
+
         let (record_key, record_value, record_type, _next_offset) =
-            decode_record_from_file(&mut reader, offset)?;
+            decode_record_from_file(buf.buffer(), offset as usize)?;
 
         // Verify key matches
-        if record_key.as_slice() == key {
+        if record_key == key {
             match record_type {
-                RecordType::Put => Ok(Some(record_value)),
+                RecordType::Put => Ok(Some(record_value.to_vec())),
                 RecordType::Delete => Ok(None), // Tombstone
             }
         } else {

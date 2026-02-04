@@ -229,7 +229,7 @@ impl<'a> WALRecord<'a> {
     }
 }
 
-pub fn recover(data: &[u8]) -> Result<Vec<WALRecord>, std::io::Error> {
+pub fn recover(data: &[u8]) -> Result<Vec<WALRecord<'_>>, std::io::Error> {
     let mut records = Vec::new();
     let header = WALHeader::decode(data)?;
 

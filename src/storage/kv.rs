@@ -1,5 +1,5 @@
 use crossbeam_skiplist::SkipMap;
-use std::fs::File;
+use std::{borrow::Cow, fs::File};
 
 use crate::{
     api::api::KVEngine,
@@ -16,7 +16,6 @@ use crate::{
 
 #[derive(Debug)]
 pub struct PersistentKV {
-    store: std::collections::HashMap<Vec<u8>, u64>,
     pub memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)>,
     pub levelstore: Vec<Vec<u8>>,
 
@@ -49,7 +48,6 @@ impl PersistentKV {
         );
 
         PersistentKV {
-            store: std::collections::HashMap::new(),
             memtable: SkipMap::new(),
             levelstore,
             memtable_size: 0,
@@ -57,8 +55,17 @@ impl PersistentKV {
     }
 }
 
+impl Default for PersistentKV {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// TODO:
+// Need find another way to much more friendly with the compiler itself
+
 impl KVEngine for PersistentKV {
-    fn get(&self, key: &[u8]) -> Result<Vec<u8>, DBError> {
+    fn get(&self, key: &[u8]) -> Result<Option<Cow<'_, Vec<u8>>>, DBError> {
         log::trace!("Getting key: {:?}", String::from_utf8_lossy(key));
 
         // 1. Search in memtable first (most recent data)
@@ -66,8 +73,8 @@ impl KVEngine for PersistentKV {
             log::debug!("Key found in memtable: {:?}", String::from_utf8_lossy(key));
             let (record_type, value) = entry.value();
             match record_type {
-                RecordType::Put => return Ok(value.clone()),
-                RecordType::Delete => return Ok(vec![]), // Tombstone - key deleted
+                RecordType::Put => return Ok(Some(Cow::Owned(value.clone()))), // Return value from memtable
+                RecordType::Delete => return Ok(None), // Tombstone - key deleted
             }
         }
 
@@ -77,7 +84,7 @@ impl KVEngine for PersistentKV {
             self.levelstore.len()
         );
 
-        // TODO: implement compaction with increment levelstore
+        let mut buf = vec![];
         for (idx, filename_bytes) in self.levelstore.iter().enumerate() {
             let filename = String::from_utf8_lossy(filename_bytes);
 
@@ -138,18 +145,20 @@ impl KVEngine for PersistentKV {
                         filename,
                         e
                     );
+
                     continue;
                 }
             };
 
-            match search_sstable_sparse(&file, key, &sparse_index)? {
+            match search_sstable_sparse(&file, key, &sparse_index, &mut buf)? {
                 Some(val) => {
                     log::debug!(
                         "Key found in SSTable {}: {:?}",
                         filename,
                         String::from_utf8_lossy(key)
                     );
-                    return Ok(val);
+
+                    return Ok(Some(Cow::Owned(val.to_vec())));
                 }
                 None => {
                     log::trace!(
@@ -166,25 +175,27 @@ impl KVEngine for PersistentKV {
             "Key not found in any SSTable: {:?}",
             String::from_utf8_lossy(key)
         );
-        Ok(vec![])
+
+        Ok(None)
     }
 
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), DBError> {
+    fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), DBError> {
         log::trace!(
             "Putting key: {:?}, value size: {} bytes",
-            String::from_utf8_lossy(key),
+            String::from_utf8_lossy(&key),
             value.len()
         );
 
         // Write to WAL and get the LSN
-        let (_offset, lsn) = storage::log::store_log("app.log", key, value, RecordType::Put)?;
+        let (_offset, lsn) = storage::log::store_log("app.log", &key, &value, RecordType::Put)?;
         log::trace!("WAL write complete with LSN: {}", lsn);
 
-        self.memtable
-            .insert(key.to_vec(), (RecordType::Put, value.to_vec()));
+        let size = key.len() + value.len();
+
+        self.memtable.insert(key, (RecordType::Put, value));
 
         // add the size of key and value to memtable_size
-        self.memtable_size += (key.len() + value.len()) as u64;
+        self.memtable_size += size as u64;
 
         log::debug!("Memtable size: {} bytes", self.memtable_size);
 
@@ -212,11 +223,11 @@ impl KVEngine for PersistentKV {
             });
 
             // Level 0 (L0) is used for memtable flushes in LSM-tree
-            const filename: &str = "app.db";
+            const FILENAME: &str = "app.db";
 
             // Record file creation in manifest
-            manifest::add_file(0, filename)?;
-            log::debug!("Added {} to manifest at level 0", filename);
+            manifest::add_file(0, FILENAME)?;
+            log::debug!("Added {} to manifest at level 0", FILENAME);
 
             // set the current memtable to a new one
             log::info!("Memtable flushed and reset");
@@ -238,50 +249,68 @@ mod tests {
 
     #[test]
     fn test_in_memory_kv() {
-        let mut kv = PersistentKV::new();
-        kv.put(b"key1", b"value1").expect("put failed");
+        #[cfg(feature = "dhat-heap")]
+        let _profiler = dhat::Profiler::new_heap();
 
-        // --- assert value exists ---
-        let result = kv.get(b"key1");
+        // Arrange - Setup KV store
+        let mut kv = PersistentKV::new();
+
+        // Act - Put a key-value pair
+        kv.put(b"key1".to_vec(), b"value1".to_vec())
+            .expect("put failed");
+
+        // Assert - Verify value exists
+        let result = kv.get(b"key1").expect("get failed");
+        assert!(result.is_some(), "expected Some, got None");
         assert_eq!(
-            result.unwrap(),
+            result.as_ref().unwrap().as_slice(),
             b"value1",
             "unexpected result from get(key1)"
         );
 
-        // --- delete ---
+        // Act - Delete the key
         kv.delete(b"key1");
 
-        // --- assert not found ---
-        let result = kv.get(b"key1");
+        // Assert - Verify key is deleted (returns None)
+        let result = kv.get(b"key1").expect("get failed");
         assert!(
-            matches!(result.as_deref(), Ok([])),
-            "expected NotFound, got: {:?}",
+            result.is_none(),
+            "expected None after delete, got: {:?}",
             result
         );
     }
 
     #[test]
     fn test_active_data() {
+        #[cfg(feature = "dhat-heap")]
+        let _profiler = dhat::Profiler::new_heap();
+
+        // Arrange - Setup KV store
         let mut kv = PersistentKV::new();
 
+        // Act - Insert 999 key-value pairs
         (1..1000)
             .try_for_each(|i| -> Result<(), DBError> {
                 kv.put(
-                    format!("key{i}").as_bytes(),
-                    format!("valuefromkey{i}").as_bytes(),
+                    format!("key{i}").as_bytes().to_vec(),
+                    format!("valuefromkey{i}").as_bytes().to_vec(),
                 )?;
 
                 Ok(())
             })
             .unwrap();
 
-        // check the missing one
+        // Assert - Check non-existent key returns None
         let result = kv.get(b"keyyangemangkosong").unwrap();
-        assert_eq!(result, b"");
+        assert!(result.is_none(), "expected None for non-existent key");
 
-        // check one of the exist key
-        let result2 = kv.get(b"key88").unwrap();
-        assert_eq!(result2, b"valuefromkey88");
+        // Assert - Check existing key returns correct value
+        let result2 = kv.get(b"key99").unwrap();
+        assert!(result2.is_some(), "expected Some for key99");
+        assert_eq!(
+            result2.as_ref().unwrap().as_slice(),
+            b"valuefromkey99",
+            "unexpected value for key99"
+        );
     }
 }

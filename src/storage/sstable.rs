@@ -856,7 +856,7 @@ pub fn read_sstable_bloom<R: Read + Seek>(
 pub fn decode_record_from_file<'a>(
     reader: &'a [u8],
     mut offset: usize,
-) -> Result<(&'a [u8], &'a [u8], RecordType, usize), std::io::Error> {
+) -> Result<(Vec<u8>, Vec<u8>, RecordType, usize), std::io::Error> {
     // Read record type
 
     let record_type = match reader[offset as usize] {
@@ -918,7 +918,7 @@ pub fn decode_record_from_file<'a>(
     // Calculate next offset
     let next_offset = offset + 1 + 8 + 8 + key_len + value_len + 4;
 
-    Ok((&key, &value, record_type, next_offset))
+    Ok((key.to_vec(), value.to_vec(), record_type, next_offset))
 }
 
 /// Search for a key in the SSTable using sparse index and linear block scan
@@ -928,7 +928,7 @@ pub fn search_sstable_sparse<'a, R>(
     key: &[u8],
     sparse_index: &[SparseIndexEntry],
     buf: &'a mut Vec<u8>,
-) -> Result<Option<&'a [u8]>, std::io::Error>
+) -> Result<Option<Vec<u8>>, std::io::Error>
 where
     R: Read + Seek,
 {
@@ -975,7 +975,7 @@ where
     // Read records in this block until we find the key or reach the end
     let mut current_offset = block.block_offset as usize;
     let mut records_scanned = 0;
-    reader.read_to_end(buf);
+    reader.read_to_end(buf)?;
 
     loop {
         // Try to read a record at current offset

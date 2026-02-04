@@ -73,7 +73,7 @@ impl KVEngine for PersistentKV {
             log::debug!("Key found in memtable: {:?}", String::from_utf8_lossy(key));
             let (record_type, value) = entry.value();
             match record_type {
-                RecordType::Put => return Ok(Some(Cow::Owned(value.clone()))), // Return value from memtable
+                RecordType::Put => return Ok(Some(Cow::Owned(value.clone()))), // Return value from memtable, Allocated
                 RecordType::Delete => return Ok(None), // Tombstone - key deleted
             }
         }
@@ -158,7 +158,7 @@ impl KVEngine for PersistentKV {
                         String::from_utf8_lossy(key)
                     );
 
-                    return Ok(Some(Cow::Owned(val.to_vec())));
+                    return Ok(Some(Cow::Owned(val)));
                 }
                 None => {
                     log::trace!(

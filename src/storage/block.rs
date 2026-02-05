@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    io::{Cursor, Seek, SeekFrom},
+    io::{Cursor, Read, Seek, SeekFrom},
 };
 
 use crate::{
@@ -13,7 +13,7 @@ use super::constant::SSTABLE_BLOCK_SIZE;
 /// A fixed-size block (4KB) containing sorted key-value records
 /// Each block has a header with metadata and contains multiple records
 #[derive(Debug, Clone)]
-pub struct Block<'a> {
+pub struct Block {
     /// Offset of this block in the SSTable file
     pub offset: u64,
     /// First key in this block (for sparse index)
@@ -26,7 +26,7 @@ pub struct Block<'a> {
     pub data_size: u32,
 
     /// Add this when decode the data / load the data
-    pub data: Option<BTreeMap<&'a [u8], Record<'a>>>,
+    pub data: Option<BTreeMap<Vec<u8>, Record>>,
 }
 
 /// Builder for creating fixed-size blocks
@@ -80,7 +80,7 @@ impl BlockBuilder {
     }
 
     /// Finalize the current block and return its metadata and data
-    pub fn build<'a>(self) -> Option<(Block<'a>, Vec<u8>)> {
+    pub fn build<'a>(self) -> Option<(Block, Vec<u8>)> {
         if self.data.is_empty() {
             return None;
         }
@@ -113,7 +113,7 @@ impl BlockBuilder {
     }
 }
 
-impl<'a> Block<'a> {
+impl Block {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
 
@@ -136,42 +136,44 @@ impl<'a> Block<'a> {
         buf
     }
 
-    pub fn decode(data: &mut Cursor<&'a [u8]>, offset: u64) -> Result<Self, DBError> {
+    pub fn decode(data: &mut Cursor<Vec<u8>>, offset: u64) -> Result<Self, DBError> {
         // 1. Move the cursor (purely for state consistency, though we use slice offsets)
         data.seek(SeekFrom::Start(offset))?;
-        let slice = data.get_ref();
-        let mut pos = offset as usize;
 
         // 2. Decode First Key
-        let first_key_len = u32::from_be_bytes(slice[pos..pos + 4].try_into()?) as usize;
-        pos += 4;
-        let first_key = &slice[pos..pos + first_key_len];
-        pos += first_key_len;
+        let mut len_buf = [0u8; 4];
+        data.read_exact(&mut len_buf)?;
+        let first_key_len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut first_key = vec![0u8; first_key_len];
+        data.read_exact(&mut first_key)?;
 
         // 3. Decode Last Key
-        let last_key_len = u32::from_be_bytes(slice[pos..pos + 4].try_into()?) as usize;
-        pos += 4;
-        let last_key = &slice[pos..pos + last_key_len];
-        pos += last_key_len;
+        data.read_exact(&mut len_buf)?;
+        let last_key_len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut last_key = vec![0u8; last_key_len];
+        data.read_exact(&mut last_key)?;
 
         // 4. Decode record_count and data_size
         // Both are u32 as per the struct definition
-        let record_count = u32::from_be_bytes(slice[pos..pos + 4].try_into()?);
-        pos += 4;
+        data.read_exact(&mut len_buf)?;
+        let record_count = u32::from_be_bytes(len_buf);
 
-        let data_size = u32::from_be_bytes(slice[pos..pos + 4].try_into()?);
-        pos += 4;
+        data.read_exact(&mut len_buf)?;
+        let data_size = u32::from_be_bytes(len_buf);
 
         let mut records = BTreeMap::new();
         for _ in 0..record_count {
             // we want to traverse and decode each record that available in
             // this block
 
-            let record = record::Record::decode(data, pos as u64)?;
-            // move the pos to next record
-            pos = data.position() as usize;
+            // Get current cursor position for record decoding
+            let current_pos = data.position();
+            let record = record::Record::decode(data, current_pos)?;
 
-            records.insert(record.key, record);
+            let key = record.key.clone();
+            records.insert(key, record);
         }
 
         Ok(Block {
@@ -200,7 +202,7 @@ mod tests {
 
         // Add a small record
         let key1 = b"key1";
-        let record = Record::new(key1, b"value1", RecordType::Put, 1000);
+        let record = Record::new(key1.to_vec(), b"value1".to_vec(), RecordType::Put, 1000);
         let record_bytes = record.encode();
 
         let result = builder.add_record(&record);
@@ -211,7 +213,7 @@ mod tests {
         // Try to add a record that would exceed block size
         let key2 = b"key2";
         let large_value = vec![0u8; SSTABLE_BLOCK_SIZE];
-        let large_record = Record::new(key2, &large_value, RecordType::Put, 2000);
+        let large_record = Record::new(key2.to_vec(), large_value, RecordType::Put, 2000);
         let _large_record_bytes = large_record.encode();
 
         let result = builder.add_record(&large_record);
@@ -224,7 +226,7 @@ mod tests {
         let (parent_block, data) = result.unwrap();
 
         // try to decode the block_header
-        let mut cursor = Cursor::new(data.as_slice());
+        let mut cursor = Cursor::new(data.clone());
         let block = Block::decode(&mut cursor, 0).unwrap();
 
         assert_eq!(block.record_count, 1);
@@ -253,12 +255,12 @@ mod tests {
         let mut builder = BlockBuilder::new(0);
         let key = b"test_key";
         let value = b"test_value";
-        let record = Record::new(key, value, RecordType::Put, 1000);
+        let record = Record::new(key.to_vec(), value.to_vec(), RecordType::Put, 1000);
         builder.add_record(&record).unwrap();
         let (_, data) = builder.build().unwrap();
 
         // Act: Decode the block
-        let mut cursor = Cursor::new(data.as_slice());
+        let mut cursor = Cursor::new(data.clone());
         let block = Block::decode(&mut cursor, 0).unwrap();
 
         // Assert: block.data should contain exactly 1 record with correct values
@@ -290,13 +292,13 @@ mod tests {
         ];
 
         for (key, value) in &records_data {
-            let record = Record::new(key, value, RecordType::Put, 1000);
+            let record = Record::new(key.to_vec(), value.to_vec(), RecordType::Put, 1000);
             builder.add_record(&record).unwrap();
         }
         let (_, data) = builder.build().unwrap();
 
         // Act: Decode the block
-        let mut cursor = Cursor::new(data.as_slice());
+        let mut cursor = Cursor::new(data.clone());
         let block = Block::decode(&mut cursor, 0).unwrap();
 
         // Assert: block.data should contain all 4 records in correct order
@@ -342,23 +344,23 @@ mod tests {
         let mut builder = BlockBuilder::new(0);
 
         // Add 2 Put records
-        let record1 = Record::new(b"key1", b"value1", RecordType::Put, 1000);
+        let record1 = Record::new(b"key1".to_vec(), b"value1".to_vec(), RecordType::Put, 1000);
         builder.add_record(&record1).unwrap();
 
-        let record2 = Record::new(b"key2", b"value2", RecordType::Put, 2000);
+        let record2 = Record::new(b"key2".to_vec(), b"value2".to_vec(), RecordType::Put, 2000);
         builder.add_record(&record2).unwrap();
 
         // Add 2 Delete (tombstone) records
-        let record3 = Record::tombstone(b"key3", 3000);
+        let record3 = Record::tombstone(b"key3".to_vec(), 3000);
         builder.add_record(&record3).unwrap();
 
-        let record4 = Record::tombstone(b"key4", 4000);
+        let record4 = Record::tombstone(b"key4".to_vec(), 4000);
         builder.add_record(&record4).unwrap();
 
         let (_, data) = builder.build().unwrap();
 
         // Act: Decode the block
-        let mut cursor = Cursor::new(data.as_slice());
+        let mut cursor = Cursor::new(data.clone());
         let block = Block::decode(&mut cursor, 0).unwrap();
 
         // Assert: All 4 records should be decoded with correct types
@@ -424,24 +426,34 @@ mod tests {
 
         // Short key (4 bytes)
         let short_key = b"key1";
-        let record1 = Record::new(short_key, b"value1", RecordType::Put, 1000);
+        let record1 = Record::new(
+            short_key.to_vec(),
+            b"value1".to_vec(),
+            RecordType::Put,
+            1000,
+        );
         builder.add_record(&record1).unwrap();
 
         // Medium key (50 bytes)
         let medium_key = b"medium_key_with_exactly_50_bytes_in_total_here!!!!";
         assert_eq!(medium_key.len(), 50, "Medium key should be 50 bytes");
-        let record2 = Record::new(medium_key, b"value2", RecordType::Put, 2000);
+        let record2 = Record::new(
+            medium_key.to_vec(),
+            b"value2".to_vec(),
+            RecordType::Put,
+            2000,
+        );
         builder.add_record(&record2).unwrap();
 
         // Long key (200 bytes)
         let long_key = vec![b'x'; 200];
-        let record3 = Record::new(&long_key, b"value3", RecordType::Put, 3000);
+        let record3 = Record::new(long_key.clone(), b"value3".to_vec(), RecordType::Put, 3000);
         builder.add_record(&record3).unwrap();
 
         let (_, data) = builder.build().unwrap();
 
         // Act: Decode the block
-        let mut cursor = Cursor::new(data.as_slice());
+        let mut cursor = Cursor::new(data.clone());
         let block = Block::decode(&mut cursor, 0).unwrap();
 
         // Assert: All 3 records should be decoded with correct key sizes
@@ -482,15 +494,15 @@ mod tests {
 
         // Arrange: Create a block with known size
         let mut builder = BlockBuilder::new(0);
-        let record1 = Record::new(b"key1", b"value1", RecordType::Put, 1000);
-        let record2 = Record::new(b"key2", b"value2", RecordType::Put, 2000);
+        let record1 = Record::new(b"key1".to_vec(), b"value1".to_vec(), RecordType::Put, 1000);
+        let record2 = Record::new(b"key2".to_vec(), b"value2".to_vec(), RecordType::Put, 2000);
         builder.add_record(&record1).unwrap();
         builder.add_record(&record2).unwrap();
 
         let (block_metadata, data) = builder.build().unwrap();
 
         // Act: Decode the block and check cursor position
-        let mut cursor = Cursor::new(data.as_slice());
+        let mut cursor = Cursor::new(data.clone());
         let initial_pos = cursor.position();
         let block = Block::decode(&mut cursor, 0).unwrap();
         let final_pos = cursor.position();
@@ -522,7 +534,7 @@ mod tests {
 
         // Arrange: Build a valid block, then corrupt a byte in the record data
         let mut builder = BlockBuilder::new(0);
-        let record = Record::new(b"key1", b"value1", RecordType::Put, 1000);
+        let record = Record::new(b"key1".to_vec(), b"value1".to_vec(), RecordType::Put, 1000);
         builder.add_record(&record).unwrap();
         let (block_metadata, mut data) = builder.build().unwrap();
 
@@ -538,7 +550,7 @@ mod tests {
         }
 
         // Act: Attempt to decode the corrupted block
-        let mut cursor = Cursor::new(data.as_slice());
+        let mut cursor = Cursor::new(data);
         let result = Block::decode(&mut cursor, 0);
 
         // Assert: Decode should fail due to checksum mismatch
@@ -553,7 +565,7 @@ mod tests {
 
         // Arrange: Manually construct a block with invalid record_count
         let mut builder = BlockBuilder::new(0);
-        let record = Record::new(b"key1", b"value1", RecordType::Put, 1000);
+        let record = Record::new(b"key1".to_vec(), b"value1".to_vec(), RecordType::Put, 1000);
         builder.add_record(&record).unwrap();
         let (mut block_metadata, data) = builder.build().unwrap();
 
@@ -577,7 +589,7 @@ mod tests {
         corrupted_data.extend_from_slice(&data[header_size..]);
 
         // Act: Attempt to decode with invalid record_count
-        let mut cursor = Cursor::new(corrupted_data.as_slice());
+        let mut cursor = Cursor::new(corrupted_data);
         let result = Block::decode(&mut cursor, 0);
 
         // Assert: Decode should fail (EOF or array bounds error)

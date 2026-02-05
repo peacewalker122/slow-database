@@ -62,9 +62,9 @@ impl BloomFilter {
     }
 
     /// Insert a key into the Bloom filter
-    pub fn insert(&mut self, key: &[u8]) {
-        self.filter.insert(&key.to_vec());
-        self.keys.push(key.to_vec());
+    pub fn insert(&mut self, key: Vec<u8>) {
+        self.filter.insert(&key);
+        self.keys.push(key);
     }
 
     /// Check if a key might be in the set
@@ -125,7 +125,7 @@ impl BloomFilter {
             let mut key = vec![0u8; key_len];
             reader.read_exact(&mut key)?;
 
-            bloom_filter.insert(&key);
+            bloom_filter.insert(key);
         }
 
         Ok(bloom_filter)
@@ -148,9 +148,9 @@ mod tests {
         let mut filter = BloomFilter::with_rate(100, 0.01);
 
         // Insert some keys
-        filter.insert(b"key1");
-        filter.insert(b"key2");
-        filter.insert(b"key3");
+        filter.insert(b"key1".to_vec());
+        filter.insert(b"key2".to_vec());
+        filter.insert(b"key3".to_vec());
 
         // Should contain inserted keys
         assert!(filter.contains(b"key1"));
@@ -166,9 +166,9 @@ mod tests {
     fn test_bloom_filter_encode_decode() {
         let mut filter = BloomFilter::with_rate(100, 0.01);
 
-        filter.insert(b"apple");
-        filter.insert(b"banana");
-        filter.insert(b"cherry");
+        filter.insert(b"apple".to_vec());
+        filter.insert(b"banana".to_vec());
+        filter.insert(b"cherry".to_vec());
 
         // Encode
         let encoded = filter.encode();
@@ -190,7 +190,7 @@ mod tests {
         // Insert 1000 keys
         for i in 0..1000 {
             let key = format!("key{}", i);
-            filter.insert(key.as_bytes());
+            filter.insert(key.as_bytes().to_vec());
         }
 
         // Check false positive rate
@@ -219,7 +219,7 @@ mod tests {
 
         // Insert all keys
         for key in &keys {
-            filter.insert(*key);
+            filter.insert(key.to_vec());
         }
 
         // All inserted keys must be found (no false negatives)
@@ -236,8 +236,8 @@ mod tests {
     fn test_bloom_filter_clear() {
         let mut filter = BloomFilter::with_rate(100, 0.01);
 
-        filter.insert(b"key1");
-        filter.insert(b"key2");
+        filter.insert(b"key1".to_vec());
+        filter.insert(b"key2".to_vec());
 
         assert!(filter.contains(b"key1"));
 

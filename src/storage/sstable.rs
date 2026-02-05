@@ -15,15 +15,20 @@ use crate::{
 
 use super::{block::BlockBuilder, bloom::BloomFilter, record::RecordType};
 
+// The structure itself is
+// 1. Block
+// 2. Index, sparse index
+// 3. Bloom filter
+// 4. Footer
 #[derive(Debug)]
-struct SSTable<'a> {
-    block: Vec<Block<'a>>,
+struct SSTable {
+    block: Vec<Block>,
     index: Vec<SparseIndexEntry>,
     bloom: BloomFilter,
     footer: SSTableFooter,
 }
 
-impl<'a> SSTable<'a> {
+impl SSTable {
     pub fn decode(mut file: File) -> Result<Self, DBError> {
         let mut cursor = BufReader::new(&mut file);
 
@@ -53,21 +58,19 @@ impl<'a> SSTable<'a> {
         cursor.seek(SeekFrom::Start(footer.data_block_start))?;
         cursor.read_exact(&mut block_buf)?;
 
-        // Leak the buffer to create a 'static lifetime reference
-        // This allows Block<'a> to safely borrow from this data
-        // NOTE: This intentionally leaks memory (acceptable for testing/prototyping)
-        let block_data_static: &'static [u8] = Box::leak(block_buf.into_boxed_slice());
-        let mut block_cursor = std::io::Cursor::new(block_data_static);
+        // this block_cursor ownership will later be passed to Block::decode
+        let mut block_cursor = std::io::Cursor::new(block_buf);
 
         // Read all index entries and decode blocks
         let mut blocks = Vec::new();
         for _ in 0..entry_count {
             let entry = SparseIndexEntry::decode(&mut index_cursor)?;
-            let offset = entry.block_offset;
+            // Adjust offset to be relative to the start of the data block section
+            let relative_offset = entry.block_offset - footer.data_block_start;
             index.push(entry);
 
             // Decode the block from the static data
-            let block = Block::decode(&mut block_cursor, offset)?;
+            let block = Block::decode(&mut block_cursor, relative_offset)?;
             blocks.push(block);
         }
 
@@ -350,20 +353,9 @@ fn verify_bloom_checksum(data: &[u8], expected: u32) -> Result<(), std::io::Erro
     Ok(())
 }
 
-/// Flush memtable to SSTable with 4KB blocks
-///
-/// # Arguments
-/// * `memtable` - The memtable to flush
-/// * `filename` - The filename to write the SSTable to
-/// * `_level` - The LSM-tree level (0 for memtable flushes, 1+ for compaction)
-/// * `_file_id` - Unique identifier for this SSTable file (typically timestamp)
-///
-/// # File Naming Convention
-/// Files are named as: `app-L{level}-{file_id}.db`
-/// Example: `app-L0-1735948800.db` for a Level 0 SSTable with timestamp ID
 static DBFILENAME: &str = "app.db";
 pub fn flush_memtable(
-    memtable: &SkipMap<Vec<u8>, (RecordType, Vec<u8>)>,
+    memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)>,
     filename: &str,
     _level: u32,
     _file_id: u64,
@@ -405,34 +397,16 @@ pub fn flush_memtable(
         Vec::new()
     };
 
-    // Create owned copies of memtable data and leak to get 'static lifetime
-    // This is necessary because Record<'a> holds borrowed references
-    let mut memtable_data: Vec<(Vec<u8>, RecordType, Vec<u8>)> = Vec::new();
-    for entry in memtable.iter() {
-        let key = entry.key().clone();
-        let (record_type, value) = entry.value();
-        memtable_data.push((key, *record_type, value.clone()));
-    }
-
-    // Leak the data to get 'static lifetime
-    let memtable_static: &'static [(Vec<u8>, RecordType, Vec<u8>)] =
-        Box::leak(memtable_data.into_boxed_slice());
-
+    //
     // Perform merge if we have existing blocks
-    let records_to_write: Vec<Record<'static>> = if !existing_blocks.is_empty() {
+    let records_to_write: Vec<Record> = if !existing_blocks.is_empty() {
         log::info!(
             "Merging memtable with {} existing blocks",
             existing_blocks.len()
         );
 
-        // Convert to SkipMap with static references
-        let memtable_refs: SkipMap<&'static [u8], (RecordType, &'static [u8])> = SkipMap::new();
-        for (key, record_type, value) in memtable_static.iter() {
-            memtable_refs.insert(key.as_slice(), (*record_type, value.as_slice()));
-        }
-
         // Merge and get sorted records
-        match merge_sstables(&memtable_refs, existing_blocks) {
+        match merge_sstables(&memtable, &existing_blocks) {
             Ok(merged) => {
                 log::info!("Merge completed, writing {} records", merged.len());
                 merged
@@ -440,13 +414,13 @@ pub fn flush_memtable(
             Err(e) => {
                 log::error!("Merge failed: {:?}, falling back to memtable only", e);
                 // Fallback: convert memtable directly from static data
-                memtable_static
+                memtable
                     .iter()
-                    .map(|(key, record_type, value)| {
+                    .map(|entry| {
                         Record::new(
-                            key.as_slice(),
-                            value.as_slice(),
-                            *record_type,
+                            entry.key().to_owned(),
+                            entry.value().1.to_owned(),
+                            entry.value().0,
                             crate::storage::record::current_timestamp_millis(),
                         )
                     })
@@ -456,13 +430,13 @@ pub fn flush_memtable(
     } else {
         // No existing data, just convert memtable to records from static data
         log::debug!("No merge needed, writing memtable only");
-        memtable_static
+        memtable
             .iter()
-            .map(|(key, record_type, value)| {
+            .map(|entry| {
                 Record::new(
-                    key.as_slice(),
-                    value.as_slice(),
-                    *record_type,
+                    entry.key().to_owned(),
+                    entry.value().1.to_owned(),
+                    entry.value().0,
                     crate::storage::record::current_timestamp_millis(),
                 )
             })
@@ -497,7 +471,7 @@ pub fn flush_memtable(
     // Write all merged records to blocks
     for record in records_to_write.iter() {
         // Insert key into Bloom filter
-        bloom_filter.insert(record.key);
+        bloom_filter.insert(record.key.to_owned());
 
         // Try to add record to current block
         match block_builder.add_record(record) {
@@ -525,8 +499,9 @@ pub fn flush_memtable(
                     });
 
                     // Store block data
+                    let block_total_size = block_data.len() as u64;
                     blocks.push(block_data);
-                    current_offset += block_meta.data_size as u64;
+                    current_offset += block_total_size;
                 }
 
                 // Create new block and add the record that didn't fit
@@ -539,26 +514,26 @@ pub fn flush_memtable(
     }
 
     // Finalize the last block if it has data
-    if !block_builder.is_empty() {
-        if let Some((block_meta, block_data)) = block_builder.build() {
-            log::trace!(
-                "Final block: offset={}, size={} bytes, records={}, first_key={:?}, last_key={:?}",
-                block_meta.offset,
-                block_meta.data_size,
-                block_meta.record_count,
-                String::from_utf8_lossy(&block_meta.first_key),
-                String::from_utf8_lossy(&block_meta.last_key)
-            );
+    if !block_builder.is_empty()
+        && let Some((block_meta, block_data)) = block_builder.build()
+    {
+        log::trace!(
+            "Final block: offset={}, size={} bytes, records={}, first_key={:?}, last_key={:?}",
+            block_meta.offset,
+            block_meta.data_size,
+            block_meta.record_count,
+            String::from_utf8_lossy(&block_meta.first_key),
+            String::from_utf8_lossy(&block_meta.last_key)
+        );
 
-            sparse_index.push(SparseIndexEntry {
-                first_key: block_meta.first_key,
-                block_offset: block_meta.offset,
-                last_key: block_meta.last_key,
-                record_count: block_meta.record_count,
-            });
+        sparse_index.push(SparseIndexEntry {
+            first_key: block_meta.first_key,
+            block_offset: block_meta.offset,
+            last_key: block_meta.last_key,
+            record_count: block_meta.record_count,
+        });
 
-            blocks.push(block_data);
-        }
+        blocks.push(block_data);
     }
 
     log::info!(
@@ -632,10 +607,13 @@ pub fn flush_memtable(
     Ok(())
 }
 
+// TODO:
+// 1. change this later to be streaming merge instead of load all into memory
+// 2. implement multi sources merging
 pub fn merge_sstables<'a>(
-    memtable: &SkipMap<&'a [u8], (RecordType, &'a [u8])>,
-    sstables: Vec<Block<'a>>,
-) -> Result<Vec<Record<'a>>, DBError> {
+    memtable: &SkipMap<Vec<u8>, (RecordType, Vec<u8>)>,
+    sstables: &Vec<Block>,
+) -> Result<Vec<Record>, DBError> {
     let mut minheap = BinaryHeap::with_capacity(memtable.len() + sstables.len());
 
     // how to solve duplicate keys here?
@@ -655,62 +633,56 @@ pub fn merge_sstables<'a>(
     // And m is O(n) for sorting it
 
     // sstable
-    let mut seen_keys: BTreeMap<&'a [u8], Record<'a>> = BTreeMap::new();
+    let mut seen_keys: BTreeMap<Vec<u8>, Record> = BTreeMap::new();
 
-    // sstable
-    for sstable in sstables.iter() {
-        if let Some(val) = &sstable.data {
-            for (_, record) in val.iter() {
-                let existing = seen_keys.get(record.key);
-                match existing {
-                    Some(existing_record) => {
-                        // If existing record has older timestamp, replace it
-                        if record.timestamp > existing_record.timestamp {
-                            seen_keys.insert(record.key, record.clone());
-                        }
+    // streaming merge using iteration, side by side
+    for block in sstables.iter() {
+        if let Some(records) = &block.data {
+            for (key, record) in records.into_iter() {
+                let existing = seen_keys.get(key);
+                if let Some(existing_record) = existing {
+                    // compare timestamp
+                    if record.timestamp > existing_record.timestamp {
+                        // update with latest record
+                        seen_keys.insert(key.clone(), record.to_owned());
                     }
-                    None => {
-                        // Key not seen before, insert it
-                        seen_keys.insert(record.key, record.clone());
-                    }
+                } else {
+                    // insert new record
+                    seen_keys.insert(key.clone(), record.clone());
                 }
             }
         }
     }
 
     // memtable
-    memtable
-        .iter()
-        .map(|entry| {
-            let (record_type, value) = entry.value();
+    for entry in memtable.iter() {
+        // the solution is need to be assessed, the correct solution should be move the variable
+        // ownership to avoid cloning the value here.
+        let key = entry.key();
+        let (record_type, value) = entry.value();
+        let record = Record::new(
+            key.clone(),
+            value.clone(),
+            *record_type,
+            crate::storage::record::current_timestamp_millis(),
+        );
 
-            Record::new(
-                entry.key(),
-                value,
-                *record_type,
-                crate::storage::record::current_timestamp_millis(),
-            )
-        })
-        .for_each(|record| {
-            let existing = seen_keys.get(record.key);
-            match existing {
-                Some(existing_record) => {
-                    // If existing record has older timestamp, replace it
-                    if record.timestamp > existing_record.timestamp {
-                        seen_keys.insert(record.key, record);
-                    }
-                }
-                None => {
-                    // Key not seen before, insert it
-                    seen_keys.insert(record.key, record);
-                }
+        let existing = seen_keys.get(key);
+        if let Some(existing_record) = existing {
+            // compare timestamp
+            if record.timestamp > existing_record.timestamp {
+                // update with latest record
+                seen_keys.insert(key.clone(), record);
             }
-        });
-
-    // Now push all unique records into the min-heap for sorting
-    for record in seen_keys.values() {
-        minheap.push(Reverse(record));
+        } else {
+            // insert new record
+            seen_keys.insert(key.clone(), record);
+        }
     }
+
+    seen_keys.into_values().for_each(|record| {
+        minheap.push(Reverse(record));
+    });
 
     // Extract records from min-heap in sorted order
     let mut merged_records = Vec::with_capacity(minheap.len());
@@ -718,18 +690,7 @@ pub fn merge_sstables<'a>(
         // check if current key having duplicate key on the next record,
         // if so we need to compare the timestamp and only keep the latest one
 
-        println!(
-            "Merging record key: {:?}, timestamp: {}",
-            String::from_utf8_lossy(&record.key),
-            record.timestamp
-        );
-
         let val = minheap.peek();
-
-        println!(
-            "Next record in heap: {:?}",
-            val.as_ref().map(|r| String::from_utf8_lossy(&r.0.key))
-        );
 
         if let Some(Reverse(next_record)) = val {
             if record.key == next_record.key {
@@ -853,8 +814,8 @@ pub fn read_sstable_bloom<R: Read + Seek>(
 
 /// Helper function to decode a record from a File/generic reader at an offset
 /// This reads the data into a buffer then decodes using Record::decode
-pub fn decode_record_from_file<'a>(
-    reader: &'a [u8],
+pub fn decode_record_from_file(
+    reader: &[u8],
     mut offset: usize,
 ) -> Result<(Vec<u8>, Vec<u8>, RecordType, usize), std::io::Error> {
     // Read record type
@@ -872,21 +833,21 @@ pub fn decode_record_from_file<'a>(
     offset += 1;
 
     // Read key length
-    let mut len_buf: [u8; 8] = reader[offset..offset + 8].try_into().or_else(|e| {
-        Err(std::io::Error::new(
+    let mut len_buf: [u8; 8] = reader[offset..offset + 8].try_into().map_err(|e| {
+        std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("Failed to read key length: {:?}", e),
-        ))
+        )
     })?;
     let key_len = u64::from_be_bytes(len_buf) as usize;
     offset += 8;
 
     // Read value length
-    len_buf = reader[offset..offset + 8].try_into().or_else(|e| {
-        Err(std::io::Error::new(
+    len_buf = reader[offset..offset + 8].try_into().map_err(|e| {
+        std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("Failed to read value length: {:?}", e),
-        ))
+        )
     })?;
     let value_len = u64::from_be_bytes(len_buf) as usize;
     offset += 8;
@@ -972,10 +933,37 @@ where
     // Seek to the block and scan linearly
     reader.seek(SeekFrom::Start(block.block_offset))?;
 
-    // Read records in this block until we find the key or reach the end
-    let mut current_offset = block.block_offset as usize;
-    let mut records_scanned = 0;
+    // Read records in this block until we find the end
+    buf.clear(); // Clear buffer before reading
     reader.read_to_end(buf)?;
+
+    // Start decoding from the beginning of buf (skip the block header first)
+    // The block header contains: first_key_len + first_key + last_key_len + last_key + record_count + data_size
+    // We need to skip this header to get to the actual record data
+
+    // Decode the block header to know where records start
+    let mut pos = 0;
+
+    // Skip first_key
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+    let first_key_len = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4 + first_key_len;
+
+    // Skip last_key
+    if buf.len() < pos + 4 {
+        return Ok(None);
+    }
+    let last_key_len = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4 + last_key_len;
+
+    // Skip record_count and data_size (both u32, 4 bytes each)
+    pos += 8;
+
+    // Now pos points to the first record in the block
+    let mut current_offset = pos;
+    let mut records_scanned = 0;
 
     loop {
         // Try to read a record at current offset
@@ -1234,7 +1222,7 @@ mod tests {
             .as_nanos() as u64;
         let filename = format!("test_sstable_decode_valid_{}.db", file_id);
 
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1301,7 +1289,7 @@ mod tests {
             .as_nanos() as u64;
         let filename = format!("test_sstable_decode_single_block_{}.db", file_id);
 
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1363,7 +1351,7 @@ mod tests {
             .as_nanos() as u64;
         let filename = format!("test_sstable_decode_empty_sstable_{}.db", file_id);
 
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1395,7 +1383,7 @@ mod tests {
             file_id
         );
 
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Read the file data to corrupt it
         let mut sstable_data = std::fs::read(&filename).unwrap();
@@ -1444,7 +1432,7 @@ mod tests {
             file_id
         );
 
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Read the file data to corrupt it
         let mut sstable_data = std::fs::read(&filename).unwrap();
@@ -1488,7 +1476,7 @@ mod tests {
             file_id
         );
 
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Read the file data to corrupt it
         let mut sstable_data = std::fs::read(&filename).unwrap();
@@ -1528,7 +1516,7 @@ mod tests {
             .as_nanos() as u64;
         let filename = format!("test_sstable_decode_invalid_magic_number_{}.db", file_id);
 
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Read the file data to corrupt it
         let mut sstable_data = std::fs::read(&filename).unwrap();
@@ -1574,7 +1562,7 @@ mod tests {
             file_id
         );
 
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1656,7 +1644,7 @@ mod tests {
             file_id
         );
 
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1717,7 +1705,7 @@ mod tests {
             file_id
         );
 
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1807,7 +1795,7 @@ mod tests {
             file_id
         );
 
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1909,7 +1897,7 @@ mod tests {
             file_id
         );
 
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1976,10 +1964,10 @@ mod tests {
     #[test]
     fn test_merge_sstables_empty() {
         // Test merging empty memtable with empty SSTables
-        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+        let memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)> = SkipMap::new();
         let sstables: Vec<Block> = vec![];
 
-        let result = merge_sstables(&memtable, sstables).unwrap();
+        let result = merge_sstables(&memtable, &sstables).unwrap();
 
         assert_eq!(
             result.len(),
@@ -1991,14 +1979,14 @@ mod tests {
     #[test]
     fn test_merge_sstables_memtable_only() {
         // Test merging memtable with no SSTables - should return sorted memtable records
-        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
-        memtable.insert(b"dog", (RecordType::Put, b"woof"));
-        memtable.insert(b"cat", (RecordType::Put, b"meow"));
-        memtable.insert(b"bird", (RecordType::Put, b"tweet"));
+        let memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)> = SkipMap::new();
+        memtable.insert(b"dog".to_vec(), (RecordType::Put, b"woof".to_vec()));
+        memtable.insert(b"cat".to_vec(), (RecordType::Put, b"meow".to_vec()));
+        memtable.insert(b"bird".to_vec(), (RecordType::Put, b"tweet".to_vec()));
 
         let sstables: Vec<Block> = vec![];
 
-        let result = merge_sstables(&memtable, sstables).unwrap();
+        let result = merge_sstables(&memtable, &sstables).unwrap();
 
         assert_eq!(result.len(), 3, "Should have 3 records from memtable");
 
@@ -2017,17 +2005,22 @@ mod tests {
     #[test]
     fn test_merge_sstables_sstable_only() {
         // Test merging empty memtable with SSTable data - should return sorted SSTable records
-        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+        let memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)> = SkipMap::new();
 
         // Create a block with data
         let mut block_data = BTreeMap::new();
         block_data.insert(
-            b"apple" as &[u8],
-            Record::new(b"apple", b"red", RecordType::Put, 1000),
+            b"apple".to_vec(),
+            Record::new(b"apple".to_vec(), b"red".to_vec(), RecordType::Put, 1000),
         );
         block_data.insert(
-            b"banana" as &[u8],
-            Record::new(b"banana", b"yellow", RecordType::Put, 1000),
+            b"banana".to_vec(),
+            Record::new(
+                b"banana".to_vec(),
+                b"yellow".to_vec(),
+                RecordType::Put,
+                1000,
+            ),
         );
 
         let block = Block {
@@ -2041,7 +2034,7 @@ mod tests {
 
         let sstables = vec![block];
 
-        let result = merge_sstables(&memtable, sstables).unwrap();
+        let result = merge_sstables(&memtable, &sstables).unwrap();
 
         assert_eq!(result.len(), 2, "Should have 2 records from SSTable");
 
@@ -2057,19 +2050,24 @@ mod tests {
     #[test]
     fn test_merge_sstables_memtable_and_sstable() {
         // Test merging memtable and SSTable with non-overlapping keys
-        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
-        memtable.insert(b"dog", (RecordType::Put, b"woof"));
-        memtable.insert(b"cat", (RecordType::Put, b"meow"));
+        let memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)> = SkipMap::new();
+        memtable.insert(b"dog".to_vec(), (RecordType::Put, b"woof".to_vec()));
+        memtable.insert(b"cat".to_vec(), (RecordType::Put, b"meow".to_vec()));
 
         // Create SSTable block
         let mut block_data = BTreeMap::new();
         block_data.insert(
-            b"apple" as &[u8],
-            Record::new(b"apple", b"red", RecordType::Put, 1000),
+            b"apple".to_vec(),
+            Record::new(b"apple".to_vec(), b"red".to_vec(), RecordType::Put, 1000),
         );
         block_data.insert(
-            b"banana" as &[u8],
-            Record::new(b"banana", b"yellow", RecordType::Put, 1000),
+            b"banana".to_vec(),
+            Record::new(
+                b"banana".to_vec(),
+                b"yellow".to_vec(),
+                RecordType::Put,
+                1000,
+            ),
         );
 
         let block = Block {
@@ -2083,7 +2081,7 @@ mod tests {
 
         let sstables = vec![block];
 
-        let result = merge_sstables(&memtable, sstables).unwrap();
+        let result = merge_sstables(&memtable, &sstables).unwrap();
 
         assert_eq!(result.len(), 4, "Should have 4 merged records");
 
@@ -2098,14 +2096,19 @@ mod tests {
     fn test_merge_sstables_duplicate_keys_memtable_wins() {
         // Test merging records with duplicate keys from memtable and SSTable
         // Current implementation returns all records sorted (no deduplication yet)
-        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
-        memtable.insert(b"key1", (RecordType::Put, b"new_value"));
+        let memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)> = SkipMap::new();
+        memtable.insert(b"key1".to_vec(), (RecordType::Put, b"new_value".to_vec()));
 
         // Create SSTable block with same key
         let mut block_data = BTreeMap::new();
         block_data.insert(
-            b"key1" as &[u8],
-            Record::new(b"key1", b"old_value", RecordType::Put, 1000),
+            b"key1".to_vec(),
+            Record::new(
+                b"key1".to_vec(),
+                b"old_value".to_vec(),
+                RecordType::Put,
+                1000,
+            ),
         );
 
         let block = Block {
@@ -2119,7 +2122,7 @@ mod tests {
 
         let sstables = vec![block];
 
-        let result = merge_sstables(&memtable, sstables).unwrap();
+        let result = merge_sstables(&memtable, &sstables).unwrap();
 
         // Current implementation returns both records sorted by key, then by timestamp (desc)
         assert_eq!(result.len(), 1, "Should have 1 records");
@@ -2142,13 +2145,18 @@ mod tests {
     fn test_merge_sstables_duplicate_keys_sstable_wins() {
         // Test merging records with duplicate keys from multiple SSTables
         // Current implementation returns all records sorted (no deduplication yet)
-        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+        let memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)> = SkipMap::new();
 
         // Create two SSTable blocks with same key but different timestamps
         let mut block_data1 = BTreeMap::new();
         block_data1.insert(
-            b"key1" as &[u8],
-            Record::new(b"key1", b"old_value", RecordType::Put, 1000), // older
+            b"key1".to_vec(),
+            Record::new(
+                b"key1".to_vec(),
+                b"old_value".to_vec(),
+                RecordType::Put,
+                1000,
+            ), // older
         );
 
         let block1 = Block {
@@ -2162,8 +2170,13 @@ mod tests {
 
         let mut block_data2 = BTreeMap::new();
         block_data2.insert(
-            b"key1" as &[u8],
-            Record::new(b"key1", b"new_value", RecordType::Put, 2000), // newer
+            b"key1".to_vec(),
+            Record::new(
+                b"key1".to_vec(),
+                b"new_value".to_vec(),
+                RecordType::Put,
+                2000,
+            ), // newer
         );
 
         let block2 = Block {
@@ -2177,7 +2190,7 @@ mod tests {
 
         let sstables = vec![block1, block2];
 
-        let result = merge_sstables(&memtable, sstables).unwrap();
+        let result = merge_sstables(&memtable, &sstables).unwrap();
 
         // Current implementation returns both records sorted by key, then by timestamp (desc)
         assert_eq!(
@@ -2203,14 +2216,14 @@ mod tests {
     #[test]
     fn test_merge_sstables_multiple_sstables() {
         // Test merging multiple SSTables with non-overlapping keys
-        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
-        memtable.insert(b"zebra", (RecordType::Put, b"stripes"));
+        let memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)> = SkipMap::new();
+        memtable.insert(b"zebra".to_vec(), (RecordType::Put, b"stripes".to_vec()));
 
         // SSTable 1
         let mut block_data1 = BTreeMap::new();
         block_data1.insert(
-            b"apple" as &[u8],
-            Record::new(b"apple", b"red", RecordType::Put, 1000),
+            b"apple".to_vec(),
+            Record::new(b"apple".to_vec(), b"red".to_vec(), RecordType::Put, 1000),
         );
 
         let block1 = Block {
@@ -2225,8 +2238,8 @@ mod tests {
         // SSTable 2
         let mut block_data2 = BTreeMap::new();
         block_data2.insert(
-            b"mango" as &[u8],
-            Record::new(b"mango", b"orange", RecordType::Put, 1000),
+            b"mango".to_vec(),
+            Record::new(b"mango".to_vec(), b"orange".to_vec(), RecordType::Put, 1000),
         );
 
         let block2 = Block {
@@ -2240,7 +2253,7 @@ mod tests {
 
         let sstables = vec![block1, block2];
 
-        let result = merge_sstables(&memtable, sstables).unwrap();
+        let result = merge_sstables(&memtable, &sstables).unwrap();
 
         assert_eq!(result.len(), 3, "Should have 3 records from all sources");
 
@@ -2253,19 +2266,29 @@ mod tests {
     #[test]
     fn test_merge_sstables_preserves_record_types() {
         // Test that both Put and Delete record types are preserved
-        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
-        memtable.insert(b"deleted_key", (RecordType::Delete, b""));
-        memtable.insert(b"active_key", (RecordType::Put, b"value"));
+        let memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)> = SkipMap::new();
+        memtable.insert(b"deleted_key".to_vec(), (RecordType::Delete, b"".to_vec()));
+        memtable.insert(b"active_key".to_vec(), (RecordType::Put, b"value".to_vec()));
 
         // Create SSTable block with mixed types
         let mut block_data = BTreeMap::new();
         block_data.insert(
-            b"another_deleted" as &[u8],
-            Record::new(b"another_deleted", b"", RecordType::Delete, 1000),
+            b"another_deleted".to_vec(),
+            Record::new(
+                b"another_deleted".to_vec(),
+                b"".to_vec(),
+                RecordType::Delete,
+                1000,
+            ),
         );
         block_data.insert(
-            b"another_active" as &[u8],
-            Record::new(b"another_active", b"data", RecordType::Put, 1000),
+            b"another_active".to_vec(),
+            Record::new(
+                b"another_active".to_vec(),
+                b"data".to_vec(),
+                RecordType::Put,
+                1000,
+            ),
         );
 
         let block = Block {
@@ -2279,7 +2302,7 @@ mod tests {
 
         let sstables = vec![block];
 
-        let result = merge_sstables(&memtable, sstables).unwrap();
+        let result = merge_sstables(&memtable, &sstables).unwrap();
 
         assert_eq!(result.len(), 4, "Should have 4 records");
 
@@ -2301,21 +2324,21 @@ mod tests {
     #[test]
     fn test_merge_sstables_sorted_output() {
         // Test that output is correctly sorted by key regardless of input order
-        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
+        let memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)> = SkipMap::new();
         // Insert in random order
-        memtable.insert(b"z_last", (RecordType::Put, b"zzz"));
-        memtable.insert(b"a_first", (RecordType::Put, b"aaa"));
-        memtable.insert(b"m_middle", (RecordType::Put, b"mmm"));
+        memtable.insert(b"z_last".to_vec(), (RecordType::Put, b"zzz".to_vec()));
+        memtable.insert(b"a_first".to_vec(), (RecordType::Put, b"aaa".to_vec()));
+        memtable.insert(b"m_middle".to_vec(), (RecordType::Put, b"mmm".to_vec()));
 
         // Create SSTable block with random order keys
         let mut block_data = BTreeMap::new();
         block_data.insert(
-            b"d_four" as &[u8],
-            Record::new(b"d_four", b"ddd", RecordType::Put, 1000),
+            b"d_four".to_vec(),
+            Record::new(b"d_four".to_vec(), b"ddd".to_vec(), RecordType::Put, 1000),
         );
         block_data.insert(
-            b"b_two" as &[u8],
-            Record::new(b"b_two", b"bbb", RecordType::Put, 1000),
+            b"b_two".to_vec(),
+            Record::new(b"b_two".to_vec(), b"bbb".to_vec(), RecordType::Put, 1000),
         );
 
         let block = Block {
@@ -2329,7 +2352,7 @@ mod tests {
 
         let sstables = vec![block];
 
-        let result = merge_sstables(&memtable, sstables).unwrap();
+        let result = merge_sstables(&memtable, &sstables).unwrap();
 
         assert_eq!(result.len(), 5, "Should have 5 records");
 
@@ -2352,8 +2375,8 @@ mod tests {
     #[test]
     fn test_merge_sstables_empty_block_data() {
         // Test that blocks with None data field are handled correctly
-        let memtable: SkipMap<&[u8], (RecordType, &[u8])> = SkipMap::new();
-        memtable.insert(b"key1", (RecordType::Put, b"value1"));
+        let memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)> = SkipMap::new();
+        memtable.insert(b"key1".to_vec(), (RecordType::Put, b"value1".to_vec()));
 
         // Create block with None data
         let block = Block {
@@ -2367,7 +2390,7 @@ mod tests {
 
         let sstables = vec![block];
 
-        let result = merge_sstables(&memtable, sstables).unwrap();
+        let result = merge_sstables(&memtable, &sstables).unwrap();
 
         // Should only have memtable record since block has no data
         assert_eq!(result.len(), 1, "Should have 1 record from memtable");
@@ -2389,7 +2412,7 @@ mod tests {
         memtable1.insert(b"banana".to_vec(), (RecordType::Put, b"yellow".to_vec()));
         memtable1.insert(b"cherry".to_vec(), (RecordType::Put, b"dark_red".to_vec()));
 
-        flush_memtable(&memtable1, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable1, &filename, 0, file_id).unwrap();
 
         // Verify initial SSTable was created
         assert!(
@@ -2411,7 +2434,7 @@ mod tests {
         memtable2.insert(b"cherry".to_vec(), (RecordType::Delete, b"".to_vec()));
 
         // Step 3: Flush second memtable to same file (should trigger merge)
-        flush_memtable(&memtable2, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable2, &filename, 0, file_id).unwrap();
 
         // Step 4: Decode the merged SSTable and verify results
         let file = File::open(&filename).unwrap();
@@ -2435,7 +2458,7 @@ mod tests {
         );
 
         // Verify keys are sorted
-        let keys: Vec<&[u8]> = all_records.iter().map(|r| r.key).collect();
+        let keys: Vec<&[u8]> = all_records.iter().map(|r| r.key.as_slice()).collect();
         assert_eq!(keys[0], b"apple");
         assert_eq!(keys[1], b"banana");
         assert_eq!(keys[2], b"cherry");
@@ -2487,7 +2510,7 @@ mod tests {
         memtable.insert(b"key2".to_vec(), (RecordType::Put, b"value2".to_vec()));
 
         // Flush to new file
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Verify file was created
         assert!(
@@ -2539,7 +2562,7 @@ mod tests {
         memtable.insert(b"key1".to_vec(), (RecordType::Put, b"value1".to_vec()));
 
         // Flush should handle empty file gracefully (no merge, just write)
-        flush_memtable(&memtable, &filename, 0, file_id).unwrap();
+        flush_memtable(memtable, &filename, 0, file_id).unwrap();
 
         // Decode and verify
         let file = File::open(&filename).unwrap();

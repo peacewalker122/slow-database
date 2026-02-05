@@ -9,19 +9,19 @@ pub use super::block::{Block, BlockBuilder};
 pub use super::constant::{WAL_HEADER_SIZE, WAL_MAGIC, WAL_VERSION};
 
 pub use super::record::{
-    decode_record,
-    encode_record,
-    encode_tombstone_record,
     // Backward compatibility exports (deprecated)
     DecodeRecordResult,
     Record,
     RecordType,
+    decode_record,
+    encode_record,
+    encode_tombstone_record,
 };
 
 pub use super::sstable::{
-    flush_memtable, read_sstable_bloom, read_sstable_footer, read_sstable_index,
-    read_sstable_sparse_index, search_sstable, search_sstable_sparse, search_sstable_with_bloom,
-    IndexEntry, SSTableFooter, SparseIndexEntry,
+    IndexEntry, SSTableFooter, SparseIndexEntry, flush_memtable, read_sstable_bloom,
+    read_sstable_footer, read_sstable_index, read_sstable_sparse_index, search_sstable,
+    search_sstable_sparse, search_sstable_with_bloom,
 };
 
 /// Write WAL header to a file

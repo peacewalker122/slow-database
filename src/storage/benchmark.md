@@ -23,3 +23,9 @@ dhat: At t-gmax: 105,529 bytes in 3,002 blocks
 dhat: At t-end:  5,016 bytes in 3 blocks
 dhat: The data has been saved to dhat-heap.json, and is viewable with dhat/dh_view.html
 test storage::kv::tests::test_active_data ... ok
+
+dhat: Total:     135,515 bytes in 5,000 blocks
+dhat: At t-gmax: 105,529 bytes in 3,002 blocks
+dhat: At t-end:  5,016 bytes in 3 blocks
+dhat: The data has been saved to dhat-heap.json, and is viewable with dhat/dh_view.html
+test storage::kv::tests::test_active_data ... ok

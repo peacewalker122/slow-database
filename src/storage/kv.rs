@@ -199,7 +199,7 @@ impl KVEngine for PersistentKV {
 
         log::debug!("Memtable size: {} bytes", self.memtable_size);
 
-        if self.memtable_size >= storage::constant::MEMTABLE_SIZE_THRESHOLD {
+        if self.memtable_size >= 1024 {
             log::info!(
                 "Memtable size threshold reached ({} >= {}), flushing to SSTable",
                 self.memtable_size,
@@ -216,11 +216,10 @@ impl KVEngine for PersistentKV {
             let old_memtable = std::mem::replace(&mut self.memtable, SkipMap::new());
             self.memtable_size = 0;
 
-            std::thread::spawn(move || {
-                if let Err(e) = storage::log::flush_memtable(&old_memtable, "app.db", 0, file_id) {
-                    log::error!("Failed to flush memtable to SSTable: {}", e);
-                }
-            });
+            // WARN: sequential for now
+            if let Err(e) = storage::log::flush_memtable(old_memtable, "app.db", 0, file_id) {
+                log::error!("Failed to flush memtable to SSTable: {}", e);
+            }
 
             // Level 0 (L0) is used for memtable flushes in LSM-tree
             const FILENAME: &str = "app.db";
@@ -280,6 +279,8 @@ mod tests {
         );
     }
 
+    // NOTE: current database weren't still correct, the persistent storage weren't implemented
+    // correctly yet, its either on the decode and encode process or the sstable storage itself.
     #[test]
     fn test_active_data() {
         #[cfg(feature = "dhat-heap")]

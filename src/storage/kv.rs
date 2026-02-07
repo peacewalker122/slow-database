@@ -6,11 +6,9 @@ use crate::{
     error::DBError,
     storage::{
         self,
-        log::{
-            RecordType, read_sstable_bloom, read_sstable_footer, read_sstable_sparse_index,
-            search_sstable_sparse,
-        },
+        log::{RecordType, search_sstable_sparse},
         manifest,
+        sstable::SSTable,
         wal::WALRecord,
     },
 };
@@ -73,10 +71,14 @@ impl Default for PersistentKV {
     }
 }
 
-// TODO:
-// Need find another way to much more friendly with the compiler itself
-
 impl KVEngine for PersistentKV {
+    // WARN: curretnly it can't get the proper data when it reading through the file. What causing
+    // it? Still under investigation.
+    // Possible issues, we use sparse index but the search function might not be implemented correctly.
+    // Second, the process to merge the sstable files might not correct as well.
+    //
+    // the first issue is solved, but the second process is still issue especially when the .db
+    // file were newly created, the file is already exist but the result returning None.
     fn get(&self, key: &[u8]) -> Result<Option<Cow<'_, Vec<u8>>>, DBError> {
         log::trace!("Getting key: {:?}", String::from_utf8_lossy(key));
 
@@ -96,7 +98,6 @@ impl KVEngine for PersistentKV {
             self.levelstore.len()
         );
 
-        let mut buf = vec![];
         for (idx, filename_bytes) in self.levelstore.iter().enumerate() {
             let filename = String::from_utf8_lossy(filename_bytes);
 
@@ -116,53 +117,24 @@ impl KVEngine for PersistentKV {
                 }
             };
 
-            // Read footer and bloom filter
-            let footer = match read_sstable_footer(&file) {
-                Ok(f) => f,
-                Err(e) => {
-                    log::warn!("Failed to read footer from {}: {}, skipping", filename, e);
-                    continue;
-                }
-            };
+            let sstable = SSTable::decode(&file)?;
 
-            let bloom = match read_sstable_bloom(&file, &footer) {
-                Ok(b) => b,
-                Err(e) => {
-                    log::warn!(
-                        "Failed to read bloom filter from {}: {}, skipping",
-                        filename,
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            // Check bloom filter first - if it says key doesn't exist, skip this file
-            if !bloom.contains(key) {
-                log::trace!("Bloom filter in {}: key definitely not present", filename);
-                continue;
+            // check bloom filter first
+            println!(
+                "Checking bloom filter for key: {:?}",
+                String::from_utf8_lossy(key)
+            );
+            if !sstable.bloom.contains(key) {
+                log::trace!("Key not in bloom filter of {}", filename);
+                return Ok(None);
+                // continue; // Key definitely not in this SSTable
             }
 
-            log::trace!(
-                "Bloom filter in {}: key might be present, checking sparse index",
-                filename
+            println!(
+                "Bloom filter positive for key: {:?}",
+                String::from_utf8_lossy(key)
             );
-
-            // Bloom filter says key might exist, read sparse index and search
-            let sparse_index = match read_sstable_sparse_index(&file, &footer) {
-                Ok(idx) => idx,
-                Err(e) => {
-                    log::warn!(
-                        "Failed to read sparse index from {}: {}, skipping",
-                        filename,
-                        e
-                    );
-
-                    continue;
-                }
-            };
-
-            match search_sstable_sparse(&file, key, &sparse_index, &mut buf)? {
+            match search_sstable_sparse(&file, key, &sstable.index)? {
                 Some(val) => {
                     log::debug!(
                         "Key found in SSTable {}: {:?}",
@@ -211,7 +183,7 @@ impl KVEngine for PersistentKV {
 
         log::debug!("Memtable size: {} bytes", self.memtable_size);
 
-        if self.memtable_size >= 1024 {
+        if self.memtable_size >= 4096 {
             log::info!(
                 "Memtable size threshold reached ({} >= {}), flushing to SSTable",
                 self.memtable_size,
@@ -256,6 +228,7 @@ impl KVEngine for PersistentKV {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -301,17 +274,28 @@ mod tests {
         // Arrange - Setup KV store
         let mut kv = PersistentKV::new();
 
-        // Act - Insert 999 key-value pairs
-        (1..1000)
-            .try_for_each(|i| -> Result<(), DBError> {
+        // Act - Insert 10.000 key-value pairs
+        (1..5000)
+            .try_for_each(|_| -> Result<(), DBError> {
+                let current_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+
                 kv.put(
-                    format!("key{i}").as_bytes().to_vec(),
-                    format!("valuefromkey{i}").as_bytes().to_vec(),
+                    format!("key{current_unix}").as_bytes().to_vec(),
+                    format!("valuefromkey{current_unix}").as_bytes().to_vec(),
                 )?;
 
                 Ok(())
             })
             .unwrap();
+
+        kv.put(
+            "key99".as_bytes().to_vec(),
+            "valuefromkey99".as_bytes().to_vec(),
+        )
+        .expect("put failed for key99");
 
         // Assert - Check non-existent key returns None
         let result = kv.get(b"keyyangemangkosong").unwrap();

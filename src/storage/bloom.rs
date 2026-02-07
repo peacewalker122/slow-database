@@ -1,12 +1,12 @@
 use bloom::BloomFilter as BF;
 use std::io::Read;
 
-/// Wrapper around the bloom crate's BloomFilter
-/// for efficient membership testing in SSTable blocks
-///
-/// Note: This implementation stores the bloom filter parameters for reconstruction
-/// but doesn't serialize the actual filter state. For production use, you may want
-/// to implement proper serialization or use a different bloom filter library.
+// Wrapper around the bloom crate's BloomFilter
+// for efficient membership testing in SSTable blocks
+//
+// Note: This implementation stores the bloom filter parameters for reconstruction
+// but doesn't serialize the actual filter state. For production use, you may want
+// to implement proper serialization or use a different bloom filter library.
 
 pub struct BloomFilter {
     filter: BF,

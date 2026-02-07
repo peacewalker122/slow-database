@@ -12,8 +12,8 @@ pub use super::sstable::{
     read_sstable_footer, read_sstable_index, read_sstable_sparse_index, search_sstable,
     search_sstable_sparse, search_sstable_with_bloom,
 };
-use crate::storage::wal::{WAL, WALHeader, WALRecord};
-use std::fs::{File, OpenOptions};
+use crate::storage::wal::{WALHeader, WALRecord};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 /// Write WAL header to a file
@@ -58,9 +58,10 @@ pub fn store_log(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, thread};
-
     use super::*;
+    use crate::storage::wal::WAL;
+    use std::fs::OpenOptions;
+    use std::{sync::Arc, thread};
 
     #[test]
     fn test_store_and_decode_log() {

@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    io::{Cursor, Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom},
 };
 
 use crate::{
@@ -80,7 +80,7 @@ impl BlockBuilder {
     }
 
     /// Finalize the current block and return its metadata and data
-    pub fn build<'a>(self) -> Option<(Block, Vec<u8>)> {
+    pub fn build(self) -> Option<(Block, Vec<u8>)> {
         if self.data.is_empty() {
             return None;
         }
@@ -136,7 +136,7 @@ impl Block {
         buf
     }
 
-    pub fn decode(data: &mut Cursor<Vec<u8>>, offset: u64) -> Result<Self, DBError> {
+    pub fn decode<T: Read + Seek>(data: &mut T, offset: u64) -> Result<Self, DBError> {
         // 1. Move the cursor (purely for state consistency, though we use slice offsets)
         data.seek(SeekFrom::Start(offset))?;
 
@@ -168,9 +168,7 @@ impl Block {
             // we want to traverse and decode each record that available in
             // this block
 
-            // Get current cursor position for record decoding
-            let current_pos = data.position();
-            let record = record::Record::decode(data, current_pos)?;
+            let record = record::Record::decode(data)?;
 
             let key = record.key.clone();
             records.insert(key, record);
@@ -191,6 +189,7 @@ impl Block {
 mod tests {
     use super::*;
     use crate::storage::record::{Record, RecordType};
+    use std::io::Cursor;
 
     #[test]
     fn test_block_builder() {
@@ -315,7 +314,7 @@ mod tests {
         for (expected_key, expected_value) in records_data.iter() {
             let record = decoded_records
                 .get(*expected_key as &[u8])
-                .expect(&format!("Key {:?} should exist", expected_key));
+                .unwrap_or_else(|| panic!("Key {:?} should exist", expected_key));
             assert_eq!(
                 record.key, *expected_key,
                 "Key mismatch for {:?}",

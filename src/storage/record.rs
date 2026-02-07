@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Get current Unix timestamp in milliseconds
@@ -66,9 +66,7 @@ impl Record {
     }
 
     /// Decode a record from a reader at a specific offset
-    pub fn decode(reader: &mut Cursor<Vec<u8>>, offset: u64) -> Result<Record, std::io::Error> {
-        reader.seek(SeekFrom::Start(offset))?;
-
+    pub fn decode<T: Read + Seek>(reader: &mut T) -> Result<Record, std::io::Error> {
         let mut record_type_buf = [0u8; 1];
         reader.read_exact(&mut record_type_buf)?;
         let record_type_byte = record_type_buf[0];
@@ -111,7 +109,7 @@ impl Record {
             }
         };
 
-        let next_offset = offset + (1 + 8 + 8 + 8 + key_len + value_len + 4) as u64;
+        let next_offset = (1 + 8 + 8 + 8 + key_len + value_len + 4) as u64;
 
         Ok(Self {
             key: key_buf, // allocate new Vec for key
@@ -258,7 +256,7 @@ mod tests {
         let record = Record::tombstone(key, timestamp);
         let encoded = record.encode();
 
-        let decoded = Record::decode(&mut Cursor::new(encoded), 0).unwrap();
+        let decoded = Record::decode(&mut Cursor::new(encoded)).unwrap();
 
         assert_eq!(decoded.key, b"deleted_key");
         assert_eq!(decoded.value, b"");
@@ -274,7 +272,7 @@ mod tests {
         let record = Record::new(key, value, RecordType::Put, timestamp);
         let encoded = record.encode();
 
-        let decoded = Record::decode(&mut Cursor::new(encoded), 0).unwrap();
+        let decoded = Record::decode(&mut Cursor::new(encoded)).unwrap();
 
         // Offset should be: 1 (type) + 8 (timestamp) + 8 (key_len) + 8 (val_len) + 4 (key) + 4 (val) + 4 (checksum) = 37
         assert_eq!(decoded.offset, 37);
@@ -295,7 +293,7 @@ mod tests {
         let value_offset = 1 + 8 + 8 + 8 + 3; // After metadata and key
         encoded[value_offset] ^= 0xFF;
 
-        let result = Record::decode(&mut Cursor::new(encoded), 0);
+        let result = Record::decode(&mut Cursor::new(encoded));
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
     }
@@ -309,7 +307,7 @@ mod tests {
         let record = Record::new(key, value, RecordType::Put, timestamp);
         let encoded = record.encode();
 
-        let decoded = Record::decode(&mut Cursor::new(encoded), 0).unwrap();
+        let decoded = Record::decode(&mut Cursor::new(encoded)).unwrap();
 
         assert_eq!(decoded.timestamp, timestamp);
         assert_eq!(decoded.key, b"timestamped_key");
@@ -325,13 +323,13 @@ mod tests {
         // Test with timestamp = 0
         let record_min = Record::new(key.clone(), value.clone(), RecordType::Put, 0);
         let encoded_min = record_min.encode();
-        let decoded_min = Record::decode(&mut Cursor::new(encoded_min), 0).unwrap();
+        let decoded_min = Record::decode(&mut Cursor::new(encoded_min)).unwrap();
         assert_eq!(decoded_min.timestamp, 0);
 
         // Test with timestamp = u64::MAX
         let record_max = Record::new(key, value, RecordType::Put, u64::MAX);
         let encoded_max = record_max.encode();
-        let decoded_max = Record::decode(&mut Cursor::new(encoded_max), 0).unwrap();
+        let decoded_max = Record::decode(&mut Cursor::new(encoded_max)).unwrap();
         assert_eq!(decoded_max.timestamp, u64::MAX);
     }
 

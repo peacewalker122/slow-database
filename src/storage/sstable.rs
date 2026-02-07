@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap},
     fs::{File, OpenOptions},
@@ -21,15 +20,15 @@ use super::{block::BlockBuilder, bloom::BloomFilter, record::RecordType};
 // 3. Bloom filter
 // 4. Footer
 #[derive(Debug)]
-struct SSTable {
-    block: Vec<Block>,
-    index: Vec<SparseIndexEntry>,
-    bloom: BloomFilter,
-    footer: SSTableFooter,
+pub struct SSTable {
+    pub block: Vec<Block>,
+    pub index: Vec<SparseIndexEntry>,
+    pub bloom: BloomFilter,
+    pub footer: SSTableFooter,
 }
 
 impl SSTable {
-    pub fn decode(mut file: File) -> Result<Self, DBError> {
+    pub fn decode(mut file: &File) -> Result<Self, DBError> {
         let mut cursor = BufReader::new(&mut file);
 
         // Read footer
@@ -375,7 +374,7 @@ pub fn flush_memtable(
         if file_size > FOOTER_SIZE {
             // File has data, decode it
             log::info!("Existing SSTable found, will merge with memtable");
-            match SSTable::decode(existing_file) {
+            match SSTable::decode(&existing_file) {
                 Ok(sstable) => {
                     log::info!(
                         "Decoded {} existing blocks for merging",
@@ -397,7 +396,6 @@ pub fn flush_memtable(
         Vec::new()
     };
 
-    //
     // Perform merge if we have existing blocks
     let records_to_write: Vec<Record> = if !existing_blocks.is_empty() {
         log::info!(
@@ -884,12 +882,11 @@ pub fn decode_record_from_file(
 
 /// Search for a key in the SSTable using sparse index and linear block scan
 /// This is optimized for high-cardinality keys (like UUIDs)
-pub fn search_sstable_sparse<'a, R>(
+pub fn search_sstable_sparse<R>(
     mut reader: R,
     key: &[u8],
     sparse_index: &[SparseIndexEntry],
-    buf: &'a mut Vec<u8>,
-) -> Result<Option<Vec<u8>>, std::io::Error>
+) -> Result<Option<Vec<u8>>, DBError>
 where
     R: Read + Seek,
 {
@@ -905,6 +902,13 @@ where
         let mid = left + (right - left) / 2;
         let entry = &sparse_index[mid];
 
+        println!(
+            "Comparing key {:?} with block range {:?} - {:?}",
+            String::from_utf8_lossy(key),
+            String::from_utf8_lossy(&entry.first_key),
+            String::from_utf8_lossy(&entry.last_key),
+        );
+
         if key < entry.first_key.as_slice() {
             // Key is before this block
             right = mid;
@@ -914,6 +918,7 @@ where
         } else {
             // Key is within this block's range (first_key <= key <= last_key)
             target_block = Some(entry);
+            println!("Target block found at offset {}", entry.block_offset);
             break;
         }
     }
@@ -933,72 +938,24 @@ where
     // Seek to the block and scan linearly
     reader.seek(SeekFrom::Start(block.block_offset))?;
 
-    // Read records in this block until we find the end
-    buf.clear(); // Clear buffer before reading
-    reader.read_to_end(buf)?;
-
     // Start decoding from the beginning of buf (skip the block header first)
     // The block header contains: first_key_len + first_key + last_key_len + last_key + record_count + data_size
     // We need to skip this header to get to the actual record data
 
     // Decode the block header to know where records start
-    let mut pos = 0;
 
-    // Skip first_key
-    if buf.len() < 4 {
-        return Ok(None);
-    }
-    let first_key_len = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4 + first_key_len;
+    let block = Block::decode(&mut reader, block.block_offset)?;
+    // get the data block. Traverse through the key
 
-    // Skip last_key
-    if buf.len() < pos + 4 {
-        return Ok(None);
-    }
-    let last_key_len = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4 + last_key_len;
-
-    // Skip record_count and data_size (both u32, 4 bytes each)
-    pos += 8;
-
-    // Now pos points to the first record in the block
-    let mut current_offset = pos;
-    let mut records_scanned = 0;
-
-    loop {
-        // Try to read a record at current offset
-        match decode_record_from_file(buf, current_offset as usize) {
-            Ok((record_key, record_value, record_type, next_offset)) => {
-                records_scanned += 1;
-
-                // Check if this is our key
-                if record_key == key {
-                    log::trace!("Key found after scanning {} records", records_scanned);
-                    return match record_type {
-                        RecordType::Put => Ok(Some(record_value)),
-                        RecordType::Delete => Ok(None), // Tombstone
-                    };
-                }
-
-                // Move to next record
-                current_offset = next_offset;
-
-                // If we've scanned all records in this block, stop
-                if records_scanned >= block.record_count {
-                    break;
-                }
-            }
-            Err(_) => {
-                // Error reading record, assume we've reached the end of the block
-                break;
-            }
+    if let Some(data) = block.data
+        && let Some(record) = data.get(key)
+    {
+        match record.record_type {
+            RecordType::Put => return Ok(Some(record.value.clone())),
+            RecordType::Delete => return Ok(None), // Tombstone
         }
     }
 
-    log::trace!(
-        "Key not found after scanning {} records in block",
-        records_scanned
-    );
     Ok(None)
 }
 
@@ -1228,7 +1185,7 @@ mod tests {
         let file = File::open(&filename).unwrap();
 
         // Decode SSTable
-        let decoded = SSTable::decode(file).unwrap();
+        let decoded = SSTable::decode(&file).unwrap();
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
@@ -1295,7 +1252,7 @@ mod tests {
         let file = File::open(&filename).unwrap();
 
         // Decode SSTable
-        let decoded = SSTable::decode(file).unwrap();
+        let decoded = SSTable::decode(&file).unwrap();
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
@@ -1357,7 +1314,7 @@ mod tests {
         let file = File::open(&filename).unwrap();
 
         // Decode SSTable
-        let decoded = SSTable::decode(file).unwrap();
+        let decoded = SSTable::decode(&file).unwrap();
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
@@ -1405,7 +1362,7 @@ mod tests {
         let file = File::open(&filename).unwrap();
 
         // Decode should fail with IO error (checksum validation happens in verify_index_checksum)
-        let result = SSTable::decode(file);
+        let result = SSTable::decode(&file);
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
@@ -1449,7 +1406,7 @@ mod tests {
         let file = File::open(&filename).unwrap();
 
         // Decode should fail with IO error (checksum validation happens in verify_bloom_checksum)
-        let result = SSTable::decode(file);
+        let result = SSTable::decode(&file);
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
@@ -1492,7 +1449,7 @@ mod tests {
         let file = File::open(&filename).unwrap();
 
         // Decode should fail with IO error (checksum validation happens in SSTableFooter::decode)
-        let result = SSTable::decode(file);
+        let result = SSTable::decode(&file);
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
@@ -1533,7 +1490,7 @@ mod tests {
         let file = File::open(&filename).unwrap();
 
         // Decode should fail with IO error (magic number validation happens in SSTableFooter::decode)
-        let result = SSTable::decode(file);
+        let result = SSTable::decode(&file);
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
@@ -1568,7 +1525,7 @@ mod tests {
         let file = File::open(&filename).unwrap();
 
         // Decode SSTable
-        let decoded = SSTable::decode(file).unwrap();
+        let decoded = SSTable::decode(&file).unwrap();
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
@@ -1649,7 +1606,7 @@ mod tests {
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
 
-        let decoded = SSTable::decode(file).unwrap();
+        let decoded = SSTable::decode(&file).unwrap();
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
@@ -1710,7 +1667,7 @@ mod tests {
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
 
-        let decoded = SSTable::decode(file).unwrap();
+        let decoded = SSTable::decode(&file).unwrap();
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
@@ -1800,7 +1757,7 @@ mod tests {
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
 
-        let decoded = SSTable::decode(file).unwrap();
+        let decoded = SSTable::decode(&file).unwrap();
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
@@ -1902,7 +1859,7 @@ mod tests {
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
 
-        let decoded = SSTable::decode(file).unwrap();
+        let decoded = SSTable::decode(&file).unwrap();
 
         // Clean up
         std::fs::remove_file(&filename).unwrap();
@@ -2438,7 +2395,7 @@ mod tests {
 
         // Step 4: Decode the merged SSTable and verify results
         let file = File::open(&filename).unwrap();
-        let sstable = SSTable::decode(file).unwrap();
+        let sstable = SSTable::decode(&file).unwrap();
 
         // Collect all records from all blocks
         let mut all_records = Vec::new();
@@ -2520,7 +2477,7 @@ mod tests {
 
         // Decode and verify
         let file = File::open(&filename).unwrap();
-        let sstable = SSTable::decode(file).unwrap();
+        let sstable = SSTable::decode(&file).unwrap();
 
         let mut all_records = Vec::new();
         for block in &sstable.block {
@@ -2566,7 +2523,7 @@ mod tests {
 
         // Decode and verify
         let file = File::open(&filename).unwrap();
-        let sstable = SSTable::decode(file).unwrap();
+        let sstable = SSTable::decode(&file).unwrap();
 
         let mut all_records = Vec::new();
         for block in &sstable.block {

@@ -1,24 +1,40 @@
-use std::io::Write;
+use std::{
+    io::{BufReader, Cursor, Read, Seek, Write},
+    sync::atomic::{self, AtomicU64},
+};
 
 use crate::storage::log::{RecordType, WAL_HEADER_SIZE, WAL_MAGIC, WAL_VERSION};
 
 #[derive(Debug)]
-struct WAL<'a> {
-    header: Box<WALHeader>,
-    records: Vec<WALRecord<'a>>,
+pub struct WAL {
+    pub header: WALHeader,
+    pub records: Vec<WALRecord>,
 }
 
-impl<'a> WAL<'a> {
+impl WAL {
     pub fn new() -> Self {
         WAL {
-            header: Box::new(WALHeader::new()),
+            header: WALHeader::new(),
             records: Vec::new(),
         }
     }
 
-    pub fn update_header(&mut self, last_checkpoint: u64, last_checkpoint_offset: u64) {
-        self.header.last_checkpoint = last_checkpoint;
-        self.header.last_checkpoint_offset = last_checkpoint_offset;
+    pub fn decode<T: Read + Seek>(data: T) -> Result<Self, std::io::Error> {
+        let mut reader = BufReader::new(data);
+        let mut header_buf = vec![0u8; WAL_HEADER_SIZE as usize];
+        reader.read_exact(&mut header_buf)?;
+        let header = WALHeader::decode(&header_buf)?;
+
+        let mut records = Vec::new();
+        loop {
+            match WALRecord::decode(&mut reader) {
+                Ok((record, _)) => records.push(record),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(WAL { header, records })
     }
 }
 
@@ -53,7 +69,7 @@ impl WALHeader {
     }
 
     /// Decode header from bytes
-    pub fn decode(buf: &[u8]) -> Result<Self, std::io::Error> {
+    pub fn decode(buf: &Vec<u8>) -> Result<Self, std::io::Error> {
         if buf.len() < WAL_HEADER_SIZE as usize {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -97,48 +113,61 @@ impl Default for WALHeader {
 }
 
 #[derive(Debug)]
-pub struct WALRecord<'a> {
-    pub lsn: u64,
+pub struct WALRecord {
+    lsn: Option<AtomicU64>,
+
+    pub lsn_val: u64,
     pub record_type: RecordType,
-    pub key: &'a [u8],
-    pub value: &'a [u8],
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
 }
 
-impl<'a> WALRecord<'a> {
-    pub fn new(key: &'a [u8], value: &'a [u8], record_type: RecordType, lsn: u64) -> Self {
+impl WALRecord {
+    pub fn new() -> Self {
         WALRecord {
-            lsn,
-            key,
-            value,
-            record_type,
+            lsn: Some(AtomicU64::new(1)),
+            key: Vec::new(),
+            value: Vec::new(),
+            record_type: RecordType::Put,
+            lsn_val: 0,
         }
     }
 
-    pub fn encode<T: Write>(&self, writer: &mut T) -> Result<(), std::io::Error> {
+    pub fn encode<T: Write>(
+        &self,
+        writer: &mut T,
+        record_type: RecordType,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), std::io::Error> {
         let checksum = crc32fast::hash(&self.value);
 
-        writer.write_all(&(self.record_type as u8).to_be_bytes())?;
-        writer.write_all(&self.lsn.to_be_bytes())?;
-        writer.write_all(&(self.key.len() as u64).to_be_bytes())?;
-        writer.write_all(&(self.value.len() as u64).to_be_bytes())?;
-        writer.write_all(&self.key)?;
-        writer.write_all(&self.value)?;
+        let lsn = match &self.lsn {
+            Some(atomic_lsn) => atomic_lsn.fetch_add(1, atomic::Ordering::SeqCst),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "LSN not initialized",
+            ))?,
+        };
+
+        writer.write_all(&(record_type as u8).to_be_bytes())?;
+        writer.write_all(&lsn.to_be_bytes())?;
+        writer.write_all(&(key.len() as u64).to_be_bytes())?;
+        writer.write_all(key)?;
+        writer.write_all(&(value.len() as u64).to_be_bytes())?;
+        writer.write_all(value)?;
         writer.write_all(&checksum.to_be_bytes())?;
 
         Ok(())
     }
 
-    pub fn decode(buf: &'a [u8]) -> Result<(Self, usize), std::io::Error> {
-        let mut offset = 0;
+    pub fn decode<T: Read + Seek>(data: T) -> Result<(Self, usize), std::io::Error> {
+        let mut buf = BufReader::new(data);
 
-        if buf.len() < 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "EOF",
-            ));
-        }
+        let mut record_type_buf = [0u8; 1];
+        buf.read_exact(&mut record_type_buf)?;
 
-        let record_type = match buf[offset] {
+        let record_type = match record_type_buf[0] {
             1 => RecordType::Put,
             2 => RecordType::Delete,
             _ => {
@@ -148,67 +177,26 @@ impl<'a> WALRecord<'a> {
                 ));
             }
         };
-        offset += 1;
 
-        if buf.len() < offset + 8 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "EOF",
-            ));
-        }
         let mut len_buf = [0u8; 8];
-        len_buf.copy_from_slice(&buf[offset..offset + 8]);
+        buf.read_exact(&mut len_buf)?;
         let lsn = u64::from_be_bytes(len_buf);
-        offset += 8;
 
-        if buf.len() < offset + 8 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "EOF",
-            ));
-        }
-        len_buf.copy_from_slice(&buf[offset..offset + 8]);
+        buf.read_exact(&mut len_buf)?;
         let key_len = u64::from_be_bytes(len_buf) as usize;
-        offset += 8;
 
-        if buf.len() < offset + 8 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "EOF",
-            ));
-        }
-        len_buf.copy_from_slice(&buf[offset..offset + 8]);
+        let mut key_bytes = vec![0u8; key_len];
+        buf.read_exact(&mut key_bytes)?;
+
+        buf.read_exact(&mut len_buf)?;
         let value_len = u64::from_be_bytes(len_buf) as usize;
-        offset += 8;
 
-        if buf.len() < offset + key_len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "EOF",
-            ));
-        }
-        let key_bytes = &buf[offset..offset + key_len];
-        offset += key_len;
+        let mut value_bytes = vec![0u8; value_len];
+        buf.read_exact(&mut value_bytes)?;
 
-        if buf.len() < offset + value_len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "EOF",
-            ));
-        }
-        let value_bytes = &buf[offset..offset + value_len];
-        offset += value_len;
-
-        if buf.len() < offset + 4 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "EOF",
-            ));
-        }
         let mut crc_buf = [0u8; 4];
-        crc_buf.copy_from_slice(&buf[offset..offset + 4]);
+        buf.read_exact(&mut crc_buf)?;
         let checksum = u32::from_be_bytes(crc_buf);
-        offset += 4;
 
         if crc32fast::hash(&value_bytes) != checksum {
             return Err(std::io::Error::new(
@@ -219,19 +207,28 @@ impl<'a> WALRecord<'a> {
 
         Ok((
             WALRecord {
-                lsn,
-                key: key_bytes,
-                value: value_bytes,
+                lsn: None,
+                lsn_val: lsn,
+                key: key_bytes.to_vec(),
+                value: value_bytes.to_vec(),
                 record_type,
             },
-            offset,
+            1 + 8 + 8 + key_len + 8 + value_len + 4,
         ))
+    }
+
+    pub fn get_lsn(&self) -> u64 {
+        if let Some(atomic_lsn) = &self.lsn {
+            atomic_lsn.load(std::sync::atomic::Ordering::SeqCst)
+        } else {
+            self.lsn_val
+        }
     }
 }
 
-pub fn recover(data: &[u8]) -> Result<Vec<WALRecord<'_>>, std::io::Error> {
+pub fn recover(data: &Vec<u8>) -> Result<Vec<WALRecord>, std::io::Error> {
     let mut records = Vec::new();
-    let header = WALHeader::decode(data)?;
+    let header = WALHeader::decode(&data)?;
 
     if header.magic != *WAL_MAGIC {
         return Err(std::io::Error::new(
@@ -247,7 +244,7 @@ pub fn recover(data: &[u8]) -> Result<Vec<WALRecord<'_>>, std::io::Error> {
 
     let mut current_offset = start_offset;
     while current_offset < data.len() {
-        match WALRecord::decode(&data[current_offset..]) {
+        match WALRecord::decode(Cursor::new(&data[current_offset..])) {
             Ok((record, consumed)) => {
                 records.push(record);
                 current_offset += consumed;
@@ -263,7 +260,6 @@ pub fn recover(data: &[u8]) -> Result<Vec<WALRecord<'_>>, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     #[test]
     fn test_wal_header_encode_decode() {
@@ -282,22 +278,25 @@ mod tests {
 
     #[test]
     fn test_wal_record_encode_decode() {
-        let key = b"test_key";
-        let value = b"test_value";
+        let key = b"test_key".to_vec();
+        let value = b"test_value".to_vec();
         let record_type = RecordType::Put;
-        let lsn = 123;
+        let expected_lsn = 1;
 
-        let record = WALRecord::new(key, value, record_type, lsn);
+        let mut record = WALRecord::new();
+        record.key = key.clone();
+        record.value = value.clone();
+        record.record_type = record_type;
 
         let mut buf = Vec::new();
-        record.encode(&mut buf).unwrap();
+        record.encode(&mut buf, record_type, &key, &value).unwrap();
 
-        let (decoded, _) = WALRecord::decode(&buf).unwrap();
+        let (decoded, _) = WALRecord::decode(Cursor::new(&buf)).unwrap();
 
         assert_eq!(decoded.key, key);
         assert_eq!(decoded.value, value);
         assert_eq!(decoded.record_type, record_type);
-        assert_eq!(decoded.lsn, lsn);
+        assert_eq!(decoded.lsn_val, expected_lsn);
     }
 
     #[test]
@@ -309,11 +308,25 @@ mod tests {
         buf.extend_from_slice(&header.encode());
 
         // Write records
-        let record1 = WALRecord::new(b"key1", b"val1", RecordType::Put, 1);
-        record1.encode(&mut buf).unwrap();
+        let key1 = b"key1".to_vec();
+        let val1 = b"val1".to_vec();
+        let mut record1 = WALRecord::new();
+        record1.key = key1.clone();
+        record1.value = val1.clone();
+        record1.record_type = RecordType::Put;
+        record1
+            .encode(&mut buf, RecordType::Put, &key1, &val1)
+            .unwrap();
 
-        let record2 = WALRecord::new(b"key2", b"val2", RecordType::Delete, 2);
-        record2.encode(&mut buf).unwrap();
+        let key2 = b"key2".to_vec();
+        let val2 = b"val2".to_vec();
+        let mut record2 = WALRecord::new();
+        record2.key = key2.clone();
+        record2.value = val2.clone();
+        record2.record_type = RecordType::Delete;
+        record2
+            .encode(&mut buf, RecordType::Delete, &key2, &val2)
+            .unwrap();
 
         let records = recover(&buf).unwrap();
 
@@ -322,11 +335,11 @@ mod tests {
         assert_eq!(records[0].key, b"key1");
         assert_eq!(records[0].value, b"val1");
         assert_eq!(records[0].record_type, RecordType::Put);
-        assert_eq!(records[0].lsn, 1);
+        assert_eq!(records[0].lsn_val, 1);
 
         assert_eq!(records[1].key, b"key2");
         assert_eq!(records[1].value, b"val2");
         assert_eq!(records[1].record_type, RecordType::Delete);
-        assert_eq!(records[1].lsn, 2);
+        assert_eq!(records[1].lsn_val, 1);
     }
 }

@@ -11,6 +11,7 @@ use crate::{
             search_sstable_sparse,
         },
         manifest,
+        wal::WALRecord,
     },
 };
 
@@ -20,6 +21,8 @@ pub struct PersistentKV {
     pub levelstore: Vec<Vec<u8>>,
 
     memtable_size: u64,
+    wal: WALRecord,
+    wal_file: File,
 }
 
 impl PersistentKV {
@@ -47,10 +50,19 @@ impl PersistentKV {
             levelstore.len()
         );
 
+        let wal_file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open("app.log")
+            .expect("Failed to open WAL file");
+
         PersistentKV {
             memtable: SkipMap::new(),
             levelstore,
             memtable_size: 0,
+            wal: WALRecord::new(),
+            wal_file,
         }
     }
 }
@@ -186,11 +198,11 @@ impl KVEngine for PersistentKV {
             value.len()
         );
 
-        // Write to WAL and get the LSN
-        let (_offset, lsn) = storage::log::store_log("app.log", &key, &value, RecordType::Put)?;
-        log::trace!("WAL write complete with LSN: {}", lsn);
-
         let size = key.len() + value.len();
+        // Write to WAL and get the LSN
+        let (_offset, lsn) =
+            storage::log::store_log(&mut self.wal_file, &key, &value, RecordType::Put, &self.wal)?;
+        log::trace!("WAL write complete with LSN: {}", lsn);
 
         self.memtable.insert(key, (RecordType::Put, value));
 

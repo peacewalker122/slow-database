@@ -245,45 +245,10 @@ pub fn decode_record<R: Read + Seek>(
     })
 }
 
-/// Encode a WAL record (backward compatibility)
-pub fn encode_record(key: &[u8], value: &[u8], lsn: u64) -> Vec<u8> {
-    use super::wal::WALRecord;
-    let wal = WALRecord::new(key, value, RecordType::Put, lsn);
-    let mut buf = Vec::new();
-    wal.encode(&mut buf).expect("Failed to encode record");
-    buf
-}
-
-/// Encode a tombstone WAL record (backward compatibility)
-pub fn encode_tombstone_record(key: &[u8], lsn: u64) -> Vec<u8> {
-    use super::wal::WALRecord;
-    let wal = WALRecord::new(key, &[], RecordType::Delete, lsn);
-    let mut buf = Vec::new();
-    wal.encode(&mut buf).expect("Failed to encode record");
-    buf
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
-
-    // New tests using the Record struct API
-    #[test]
-    fn test_record_new_and_encode() {
-        // Positive test: Verifies that a Record can be created, encoded, and decoded correctly
-        let key = b"key1".to_vec();
-        let value = b"value1".to_vec();
-        let timestamp = 1234567890123_u64;
-        let record = Record::new(key, value, RecordType::Put, timestamp);
-        let encoded = record.encode();
-
-        let decoded = Record::decode(&mut Cursor::new(encoded), 0).unwrap();
-
-        assert_eq!(decoded.key, b"key1");
-        assert_eq!(decoded.value, b"value1");
-        assert_eq!(decoded.record_type, RecordType::Put);
-    }
 
     #[test]
     fn test_record_tombstone() {

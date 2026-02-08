@@ -3,8 +3,10 @@ use std::{
     collections::{BTreeMap, BinaryHeap},
     fs::{File, OpenOptions},
     io::{BufReader, Read, Seek, SeekFrom, Write},
+    time::UNIX_EPOCH,
 };
 
+use chrono::Utc;
 use crossbeam_skiplist::SkipMap;
 
 use crate::{
@@ -357,7 +359,7 @@ pub fn flush_memtable(
     memtable: SkipMap<Vec<u8>, (RecordType, Vec<u8>)>,
     filename: &str,
     _level: u32,
-    _file_id: u64,
+    file_path: &str,
 ) -> Result<(), std::io::Error> {
     log::info!(
         "Starting memtable flush to SSTable '{}' with 4KB blocks, entries: {}",
@@ -608,7 +610,7 @@ pub fn flush_memtable(
 // TODO:
 // 1. change this later to be streaming merge instead of load all into memory
 // 2. implement multi sources merging
-pub fn merge_sstables<'a>(
+pub fn merge_sstables(
     memtable: &SkipMap<Vec<u8>, (RecordType, Vec<u8>)>,
     sstables: &Vec<Block>,
 ) -> Result<Vec<Record>, DBError> {
@@ -1178,8 +1180,13 @@ mod tests {
             .unwrap()
             .as_nanos() as u64;
         let filename = format!("test_sstable_decode_valid_{}.db", file_id);
+        let wal_path = format!("test_wal_{}.log", file_id);
 
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        // Create archive directory and dummy WAL file for test
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1245,8 +1252,13 @@ mod tests {
             .unwrap()
             .as_nanos() as u64;
         let filename = format!("test_sstable_decode_single_block_{}.db", file_id);
+        let wal_path = format!("test_wal_{}.log", file_id);
 
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        // Create archive directory and dummy WAL file for test
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1307,8 +1319,13 @@ mod tests {
             .unwrap()
             .as_nanos() as u64;
         let filename = format!("test_sstable_decode_empty_sstable_{}.db", file_id);
+        let wal_path = format!("test_wal_{}.log", file_id);
 
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        // Create archive directory and dummy WAL file for test
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1339,8 +1356,13 @@ mod tests {
             "test_sstable_decode_corrupted_index_checksum_{}.db",
             file_id
         );
+        let wal_path = format!("test_wal_{}.log", file_id);
 
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        // Create archive directory and dummy WAL file for test
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Read the file data to corrupt it
         let mut sstable_data = std::fs::read(&filename).unwrap();
@@ -1388,8 +1410,13 @@ mod tests {
             "test_sstable_decode_corrupted_bloom_checksum_{}.db",
             file_id
         );
+        let wal_path = format!("test_wal_{}.log", file_id);
 
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        // Create archive directory and dummy WAL file for test
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Read the file data to corrupt it
         let mut sstable_data = std::fs::read(&filename).unwrap();
@@ -1432,8 +1459,13 @@ mod tests {
             "test_sstable_decode_corrupted_footer_checksum_{}.db",
             file_id
         );
+        let wal_path = format!("test_wal_{}.log", file_id);
 
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        // Create archive directory and dummy WAL file for test
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Read the file data to corrupt it
         let mut sstable_data = std::fs::read(&filename).unwrap();
@@ -1472,8 +1504,13 @@ mod tests {
             .unwrap()
             .as_nanos() as u64;
         let filename = format!("test_sstable_decode_invalid_magic_number_{}.db", file_id);
+        let wal_path = format!("test_wal_{}.log", file_id);
 
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        // Create archive directory and dummy WAL file for test
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Read the file data to corrupt it
         let mut sstable_data = std::fs::read(&filename).unwrap();
@@ -1518,8 +1555,13 @@ mod tests {
             "test_sstable_decode_verifies_bloom_contains_keys_{}.db",
             file_id
         );
+        let wal_path = format!("test_wal_{}.log", file_id);
 
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        // Create archive directory and dummy WAL file for test
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1600,8 +1642,13 @@ mod tests {
             "test_sstable_decode_block_data_single_record_{}.db",
             file_id
         );
+        let wal_path = format!("test_wal_{}.log", file_id);
 
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        // Create archive directory and dummy WAL file for test
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1661,8 +1708,13 @@ mod tests {
             "test_sstable_decode_block_data_multiple_records_{}.db",
             file_id
         );
+        let wal_path = format!("test_wal_{}.log", file_id);
 
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        // Create archive directory and dummy WAL file for test
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1751,8 +1803,13 @@ mod tests {
             "test_sstable_decode_block_data_preserves_tombstones_{}.db",
             file_id
         );
+        let wal_path = format!("test_wal_{}.log", file_id);
 
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        // Create archive directory and dummy WAL file for test
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -1853,8 +1910,13 @@ mod tests {
             "test_sstable_decode_block_data_multiple_blocks_{}.db",
             file_id
         );
+        let wal_path = format!("test_wal_{}.log", file_id);
 
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        // Create archive directory and dummy WAL file for test
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Open the file for decoding
         let file = File::open(&filename).unwrap();
@@ -2369,7 +2431,12 @@ mod tests {
         memtable1.insert(b"banana".to_vec(), (RecordType::Put, b"yellow".to_vec()));
         memtable1.insert(b"cherry".to_vec(), (RecordType::Put, b"dark_red".to_vec()));
 
-        flush_memtable(memtable1, &filename, 0, file_id).unwrap();
+        let wal_path1 = format!("test_wal_{}_1.log", file_id);
+        // Create archive directory and dummy WAL file for test
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path1, b"").ok();
+
+        flush_memtable(memtable1, &filename, 0, &wal_path1).unwrap();
 
         // Verify initial SSTable was created
         assert!(
@@ -2391,7 +2458,10 @@ mod tests {
         memtable2.insert(b"cherry".to_vec(), (RecordType::Delete, b"".to_vec()));
 
         // Step 3: Flush second memtable to same file (should trigger merge)
-        flush_memtable(memtable2, &filename, 0, file_id).unwrap();
+        let wal_path2 = format!("test_wal_{}_2.log", file_id);
+        std::fs::write(&wal_path2, b"").ok();
+
+        flush_memtable(memtable2, &filename, 0, &wal_path2).unwrap();
 
         // Step 4: Decode the merged SSTable and verify results
         let file = File::open(&filename).unwrap();
@@ -2467,7 +2537,11 @@ mod tests {
         memtable.insert(b"key2".to_vec(), (RecordType::Put, b"value2".to_vec()));
 
         // Flush to new file
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        let wal_path = format!("test_wal_{}.log", file_id);
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Verify file was created
         assert!(
@@ -2519,7 +2593,11 @@ mod tests {
         memtable.insert(b"key1".to_vec(), (RecordType::Put, b"value1".to_vec()));
 
         // Flush should handle empty file gracefully (no merge, just write)
-        flush_memtable(memtable, &filename, 0, file_id).unwrap();
+        let wal_path = format!("test_wal_{}.log", file_id);
+        std::fs::create_dir_all("archive").ok();
+        std::fs::write(&wal_path, b"").ok();
+
+        flush_memtable(memtable, &filename, 0, &wal_path).unwrap();
 
         // Decode and verify
         let file = File::open(&filename).unwrap();

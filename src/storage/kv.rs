@@ -1,5 +1,10 @@
 use crossbeam_skiplist::SkipMap;
-use std::{borrow::Cow, fs::File};
+use std::{
+    borrow::Cow,
+    fs::File,
+    str::FromStr,
+    sync::{Arc, Mutex, mpsc},
+};
 
 use crate::{
     api::api::KVEngine,
@@ -20,7 +25,13 @@ pub struct PersistentKV {
 
     memtable_size: u64,
     wal: WALRecord,
-    wal_file: File,
+    wal_file: Mutex<File>,
+
+    flush_sender: crossbeam_channel::Sender<FlushSignal>,
+}
+
+struct FlushSignal {
+    value: SkipMap<Vec<u8>, (RecordType, Vec<u8>)>,
 }
 
 impl PersistentKV {
@@ -42,6 +53,7 @@ impl PersistentKV {
                 levelstore.push(filename.as_bytes().to_vec());
             }
         }
+        levelstore.push(b"app.db".to_vec()); // for testing purpose
 
         log::info!(
             "PersistentKV initialized with {} files from manifest",
@@ -55,13 +67,25 @@ impl PersistentKV {
             .open("app.log")
             .expect("Failed to open WAL file");
 
-        PersistentKV {
+        // channel to send the "event" of current memtable to be flushed to SSTable
+        let (flush_sender, flush_receiver) = crossbeam_channel::bounded::<FlushSignal>(1);
+
+        let result = PersistentKV {
             memtable: SkipMap::new(),
             levelstore,
             memtable_size: 0,
             wal: WALRecord::new(),
-            wal_file,
-        }
+            wal_file: Mutex::new(wal_file),
+            flush_sender,
+        };
+
+        std::thread::spawn(move || {
+            loop {
+                flush_watcher(&flush_receiver);
+            }
+        });
+
+        result
     }
 }
 
@@ -72,15 +96,9 @@ impl Default for PersistentKV {
 }
 
 impl KVEngine for PersistentKV {
-    // WARN: curretnly it can't get the proper data when it reading through the file. What causing
-    // it? Still under investigation.
-    // Possible issues, we use sparse index but the search function might not be implemented correctly.
-    // Second, the process to merge the sstable files might not correct as well.
-    //
-    // the first issue is solved, but the second process is still issue especially when the .db
-    // file were newly created, the file is already exist but the result returning None.
     fn get(&self, key: &[u8]) -> Result<Option<Cow<'_, Vec<u8>>>, DBError> {
         log::trace!("Getting key: {:?}", String::from_utf8_lossy(key));
+        println!("Getting key: {:?}", String::from_utf8_lossy(key));
 
         // 1. Search in memtable first (most recent data)
         if let Some(entry) = self.memtable.get(key) {
@@ -172,8 +190,15 @@ impl KVEngine for PersistentKV {
 
         let size = key.len() + value.len();
         // Write to WAL and get the LSN
-        let (_offset, lsn) =
-            storage::log::store_log(&mut self.wal_file, &key, &value, RecordType::Put, &self.wal)?;
+        let (_offset, lsn) = storage::log::store_log(
+            self.wal_file
+                .get_mut()
+                .map_err(|_| DBError::MutexPoisoned("mutex was poisioned".to_owned()))?,
+            &key,
+            &value,
+            RecordType::Put,
+            &self.wal,
+        )?;
         log::trace!("WAL write complete with LSN: {}", lsn);
 
         self.memtable.insert(key, (RecordType::Put, value));
@@ -183,7 +208,9 @@ impl KVEngine for PersistentKV {
 
         log::debug!("Memtable size: {} bytes", self.memtable_size);
 
-        if self.memtable_size >= 4096 {
+        // Check if memtable size exceeds threshold
+        if self.memtable_size >= storage::constant::MEMTABLE_SIZE_THRESHOLD {
+            println!("Memtable size threshold reached, initiating flush to SSTable");
             log::info!(
                 "Memtable size threshold reached ({} >= {}), flushing to SSTable",
                 self.memtable_size,
@@ -200,19 +227,14 @@ impl KVEngine for PersistentKV {
             let old_memtable = std::mem::replace(&mut self.memtable, SkipMap::new());
             self.memtable_size = 0;
 
-            // WARN: sequential for now
-            if let Err(e) = storage::log::flush_memtable(old_memtable, "app.db", 0, file_id) {
-                log::error!("Failed to flush memtable to SSTable: {}", e);
-            }
+            // Send the old memtable to the flush watcher thread to be flushed to SSTable and
+            // checkpointing the WAL file
+            self.flush_sender
+                .send(FlushSignal {
+                    value: old_memtable,
+                })
+                .expect("Failed to send memtable to flush watcher");
 
-            // Level 0 (L0) is used for memtable flushes in LSM-tree
-            const FILENAME: &str = "app.db";
-
-            // Record file creation in manifest
-            manifest::add_file(0, FILENAME)?;
-            log::debug!("Added {} to manifest at level 0", FILENAME);
-
-            // set the current memtable to a new one
             log::info!("Memtable flushed and reset");
         }
 
@@ -223,6 +245,23 @@ impl KVEngine for PersistentKV {
         log::debug!("Deleting key: {:?}", String::from_utf8_lossy(key));
         self.memtable
             .insert(key.to_vec(), (RecordType::Delete, vec![]));
+    }
+}
+
+fn flush_watcher(flush_receiver: &crossbeam_channel::Receiver<FlushSignal>) {
+    // Non-blocking check for flush signal
+    if let Ok(signal) = flush_receiver.recv() {
+        println!("Flush watcher received memtable to flush");
+
+        match storage::log::flush_memtable(signal.value, "app.db", 0, "app.log") {
+            Ok(_) => {
+                manifest::add_file(0, "app.db")
+                    .expect("Failed to update manifest after flushing SSTable");
+            }
+            Err(e) => panic!("Failed to flush memtable to SSTable: {}", e),
+        }
+
+        log::info!("Memtable flushed successfully");
     }
 }
 
@@ -264,8 +303,6 @@ mod tests {
         );
     }
 
-    // NOTE: current database weren't still correct, the persistent storage weren't implemented
-    // correctly yet, its either on the decode and encode process or the sstable storage itself.
     #[test]
     fn test_active_data() {
         #[cfg(feature = "dhat-heap")]
@@ -274,13 +311,19 @@ mod tests {
         // Arrange - Setup KV store
         let mut kv = PersistentKV::new();
 
+        kv.put(
+            "key99".as_bytes().to_vec(),
+            "valuefromkey99".as_bytes().to_vec(),
+        )
+        .expect("put failed for key99");
+
         // Act - Insert 10.000 key-value pairs
         (1..5000)
             .try_for_each(|_| -> Result<(), DBError> {
                 let current_unix = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_secs();
+                    .as_millis();
 
                 kv.put(
                     format!("key{current_unix}").as_bytes().to_vec(),
@@ -290,12 +333,6 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-
-        kv.put(
-            "key99".as_bytes().to_vec(),
-            "valuefromkey99".as_bytes().to_vec(),
-        )
-        .expect("put failed for key99");
 
         // Assert - Check non-existent key returns None
         let result = kv.get(b"keyyangemangkosong").unwrap();
@@ -309,5 +346,10 @@ mod tests {
             b"valuefromkey99",
             "unexpected value for key99"
         );
+
+        kv.delete(b"key99");
+
+        let result3 = kv.get(b"key99").unwrap();
+        assert!(result3.is_none(), "expected None after deleting key99");
     }
 }
